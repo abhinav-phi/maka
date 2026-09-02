@@ -18,6 +18,30 @@
  */
 
 export const TUI_COPY_RESOURCES = {
+  attachments: {
+    en: {
+      usageAttach: 'Usage: /attach <image-path> — the image rides the next message you send.',
+      noAuthority:
+        'Image attachments need a Runtime Host connection; this session has no attachment authority.',
+      tooManyImages: 'At most {max} attachments can ride one message.',
+      notAnImage:
+        'Only image files can be attached in the terminal (png, jpg, gif, webp, bmp): {name}',
+      usageDetach: 'Usage: /detach <number> — 1..{max}.',
+      noStagedImages: 'No images are staged on the current draft.',
+      retractionOverflow:
+        '{overflow, plural, one {# retracted image} other {# retracted images}} not restored: a message can carry at most {max}. Re-attach what you need with /attach.',
+    },
+    zh: {
+      usageAttach: '用法：/attach <图片路径> —— 图片将随你发送的下一条消息一起提交。',
+      noAuthority: '图片附件需要 Runtime Host 连接；当前会话没有附件授权。',
+      tooManyImages: '一条消息最多携带 {max} 个附件。',
+      notAnImage: '终端中只能附加图片文件（png、jpg、gif、webp、bmp）：{name}',
+      usageDetach: '用法：/detach <编号> —— 1..{max}。',
+      noStagedImages: '当前草稿没有已附加的图片。',
+      retractionOverflow:
+        '有 {overflow} 张被取回的图片未恢复：一条消息最多携带 {max} 张。需要时请用 /attach 重新附加。',
+    },
+  },
   copy: {
     en: {
       copiedLast:
@@ -433,9 +457,11 @@ export const TUI_COPY_RESOURCES = {
         setup: 'Set up a model provider',
       },
       commands: {
+        attach: 'Attach an image to the draft (/attach <path>)',
         compact: 'Compact session context',
         context: 'Show latest request context usage',
         copy: 'Copy the last reply (or /copy all) to the clipboard',
+        detach: 'Remove a staged image (/detach <number>)',
         exit: 'Exit Maka',
         goal: 'Show autonomous goal status',
         graph: 'Show, enable, disable, or run one Graph turn',
@@ -484,9 +510,11 @@ export const TUI_COPY_RESOURCES = {
         setup: '配置模型提供商',
       },
       commands: {
+        attach: '附加一张图片到草稿（/attach <路径>）',
         compact: '压缩会话上下文',
         context: '查看最近一次请求的上下文用量',
         copy: '复制最后一条回复（或 /copy all）到剪贴板',
+        detach: '移除一张已附加的图片（/detach <编号>）',
         exit: '退出 Maka',
         goal: '查看自主目标状态',
         graph: '查看、启用、停用 Graph 模式，或执行一次 Graph 任务',
@@ -634,11 +662,15 @@ export const TUI_COPY_RESOURCES = {
       steeringLabel: 'Steering:',
       queuedLabel: 'Queued:',
       requeueHint: 'Alt+↑ take queued messages back to re-edit',
+      stagedLabel: 'Staged:',
+      detachHint: '/detach <n> remove a staged image',
     },
     zh: {
       steeringLabel: '注入：',
       queuedLabel: '已排队：',
       requeueHint: 'Alt+↑ 取回队列以重新编辑',
+      stagedLabel: '已附加：',
+      detachHint: '/detach <n> 移除一张已附加的图片',
     },
   },
   'session-status': {

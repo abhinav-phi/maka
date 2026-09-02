@@ -19,6 +19,7 @@
 
 import { Markdown, visibleWidth } from '@earendil-works/pi-tui';
 import type {
+  AttachmentRef,
   ProviderRetryEvent,
   ProviderRetryScheduledEvent,
   SandboxBoundaryRequestEvent,
@@ -118,6 +119,12 @@ export interface MakaPiTranscriptState {
    */
   steering: string[];
   followup: string[];
+  /**
+   * Client-local mirror of the draft's staged images (#4171), rendered as
+   * `Staged:` chips beside the pending bar. Labels carry name + media type —
+   * never a local path.
+   */
+  stagedImages: string[];
   /** Current non-durable provider retry progress for the activity strip. */
   providerRetry?: ProviderRetryCountdown;
 }
@@ -166,7 +173,14 @@ const LIVE_TOOL_BUFFER_MAX_CHARS = 64 * 1024;
 const LIVE_TOOL_BUFFER_MAX_CHUNKS = 512;
 
 export type MakaPiTranscriptEntry =
-  | { kind: 'user'; messageId: string; text: string; transient?: boolean }
+  | {
+      kind: 'user';
+      messageId: string;
+      text: string;
+      transient?: boolean;
+      /** Committed Session attachments this message carries; rendered as chips, never paths. */
+      attachments?: readonly AttachmentRef[];
+    }
   | { kind: 'legacy_automation'; text: string }
   | { kind: 'goal_continuation'; text: string }
   | { kind: 'assistant'; messageId: string; text: string }
@@ -242,6 +256,7 @@ export function createMakaPiTranscriptState(): MakaPiTranscriptState {
     usage: { costUsd: 0, cacheHitInput: 0, cacheMissInput: 0 },
     steering: [],
     followup: [],
+    stagedImages: [],
   };
 }
 
@@ -271,12 +286,14 @@ export function appendUserPrompt(
   text: string,
   messageId: string,
   transient = false,
+  attachments?: readonly AttachmentRef[],
 ): void {
   const entry = {
     kind: 'user',
     messageId,
     text,
     ...(transient ? { transient: true } : {}),
+    ...(attachments && attachments.length > 0 ? { attachments } : {}),
   } as const;
   const existingIndex = state.entries.findIndex(
     (candidate) => candidate.kind === 'user' && candidate.messageId === messageId,
@@ -975,6 +992,7 @@ export function applyMakaSessionEventToTranscript(
             entry.messageId === event.messageId &&
             entry.transient === true,
         ),
+        event.content.attachments,
       );
       break;
 
@@ -1078,6 +1096,9 @@ function storedMessagesToTranscriptEntries(
             kind: 'user',
             messageId: message.id,
             text: message.displayText ?? message.text,
+            ...(message.attachments && message.attachments.length > 0
+              ? { attachments: message.attachments }
+              : {}),
           });
         }
         break;
@@ -1521,7 +1542,7 @@ function renderTranscriptEntryBlock(entry: MakaPiTranscriptEntry, width: number)
   const lines = (() => {
     switch (entry.kind) {
       case 'user':
-        return renderUserBlock(entry.text, contentWidth);
+        return renderUserBlock(entry.text, contentWidth, entry.attachments);
       case 'legacy_automation':
         return renderLegacyAutomationBlock(entry.text, contentWidth);
       case 'goal_continuation':
@@ -1554,9 +1575,10 @@ function isBlankTranscriptLine(line: string): boolean {
 
 function transcriptEntrySignature(entry: MakaPiTranscriptEntry, width: number): string {
   switch (entry.kind) {
-    // User text is immutable, so length is a safe change key.
+    // User text is immutable, so length is a safe change key; attachments are
+    // immutable per message too, so their committed identity participates once.
     case 'user':
-      return `user|${width}|${entry.text.length}`;
+      return `user|${width}|${entry.text.length}|${entry.attachments?.length ?? 0}`;
     case 'legacy_automation':
       return `legacy_automation|${width}|${entry.text}`;
     case 'goal_continuation':
@@ -1880,6 +1902,8 @@ interface TuiPendingQueueCopy {
   readonly steeringLabel: string;
   readonly queuedLabel: string;
   readonly requeueHint: string;
+  readonly stagedLabel: string;
+  readonly detachHint: string;
 }
 
 const TUI_PENDING_QUEUE_COPY = resolveUiMessageCatalog(
@@ -1892,20 +1916,31 @@ export function renderMakaPiPendingQueue(
   platform: NodeJS.Platform,
   locale: UiLocale,
 ): string[] {
-  if (state.steering.length === 0 && state.followup.length === 0) {
+  if (
+    state.stagedImages.length === 0 &&
+    state.steering.length === 0 &&
+    state.followup.length === 0
+  ) {
     return [];
   }
   const copy = TUI_PENDING_QUEUE_COPY[locale];
   const safeWidth = Math.max(1, width);
-  const steering = state.steering;
-  const followup = state.followup;
   const lines: string[] = [];
-  for (const text of steering) {
+  // Staged images render beside the pending queues: they belong to the same
+  // "about to be submitted" surface, and the strip is separate from the
+  // editable draft text (matching the Desktop composer's staged cards).
+  for (const staged of state.stagedImages) {
+    lines.push(fitLine(`${ansi.accent(copy.stagedLabel)} ${ansi.dim(staged)}`, safeWidth));
+  }
+  if (state.stagedImages.length > 0) {
+    lines.push(fitLine(ansi.dim(renderTuiShortcutCopy(copy.detachHint, platform)), safeWidth));
+  }
+  for (const text of state.steering) {
     lines.push(
       fitLine(`${ansi.accent(copy.steeringLabel)} ${ansi.dim(firstLinePreview(text))}`, safeWidth),
     );
   }
-  for (const text of followup) {
+  for (const text of state.followup) {
     lines.push(
       fitLine(`${ansi.dim(copy.queuedLabel)} ${ansi.dim(firstLinePreview(text))}`, safeWidth),
     );
@@ -2151,13 +2186,35 @@ function pushShellRunSettledNotice(state: MakaPiTranscriptState, entry: MakaPiTo
   });
 }
 
-/** A user turn: a dim `>` quote prefix per line, no speaker label. */
-function renderUserBlock(text: string, width: number): string[] {
-  if (!text.trim()) return [];
+/** A user turn: a dim `>` quote prefix per line, no speaker label. Committed
+ * Session attachments render as a dim chip line per attachment — names and
+ * media types only, never a local path or a bytes payload. */
+function renderUserBlock(
+  text: string,
+  width: number,
+  attachments?: readonly AttachmentRef[],
+): string[] {
+  if (!text.trim() && !(attachments && attachments.length > 0)) return [];
   const prefix = ansi.dim('>');
   // renderIndented reserves a 2-column gutter; reuse it and swap the two
   // leading spaces for `> ` so wrapped lines stay aligned under the prefix.
-  return renderIndented(text, width, 2).map((line) => fitLine(`${prefix} ${line.slice(2)}`, width));
+  const body = text.trim()
+    ? renderIndented(text, width, 2).map((line) => fitLine(`${prefix} ${line.slice(2)}`, width))
+    : [];
+  const chips = (attachments ?? []).map((attachment) =>
+    fitLine(`${prefix} ${ansi.dim(userAttachmentChipLabel(attachment))}`, width),
+  );
+  return [...body, ...chips];
+}
+
+function userAttachmentChipLabel(attachment: AttachmentRef): string {
+  return `📎 ${attachment.name} · ${attachment.mimeType} · ${formatAttachmentBytes(attachment.bytes)}`;
+}
+
+function formatAttachmentBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 /** Provenance header + indented body for non-human-authored prompts. */

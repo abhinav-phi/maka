@@ -34,7 +34,6 @@ on:
   push:
     branches: [main]
     paths:
-      - .github/workflows/dependency-audit.yml
       - scripts/audit-shipped-dependencies.mjs
       - scripts/third-party-closure.mjs
       - package.json
@@ -51,7 +50,7 @@ concurrency:
 
 jobs:
   audit:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - name: Check out the repository

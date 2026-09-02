@@ -42,7 +42,7 @@ export interface TuiCopyCopy {
   readonly tooLarge: string;
   /** Shown when there is nothing to copy yet. */
   readonly nothingToCopy: string;
-  /** Shown when `/copy` receives an unsupported argument. */
+  /** `/copy` usage line. */
   readonly usage: string;
   /** Role label for user turns in `/copy all`. */
   readonly roleUser: string;
@@ -60,6 +60,31 @@ const TUI_COPY_COMMAND_COPY = resolveUiMessageCatalog(
 
 export function getTuiCopyCopy(locale: UiLocale): TuiCopyCopy {
   return TUI_COPY_COMMAND_COPY[locale];
+}
+
+export interface TuiAttachmentsCopy {
+  /** `/attach` usage line. */
+  readonly usageAttach: string;
+  /** Shown when the driver has no artifact ingest authority. */
+  readonly noAuthority: string;
+  /** ICU: refusal when more than the per-message cap would ride one draft. Takes `{max}`. */
+  readonly tooManyImages: string;
+  /** ICU: refusal for a non-image path. Takes `{name}`. */
+  readonly notAnImage: string;
+  /** ICU: `/detach` usage line. Takes `{max}`. */
+  readonly usageDetach: string;
+  /** Shown when `/detach` is typed with nothing staged. */
+  readonly noStagedImages: string;
+  /** ICU: retraction-restage overflow notice. Takes `{overflow}`, `{max}`. */
+  readonly retractionOverflow: string;
+}
+
+const TUI_ATTACHMENTS_COPY = resolveUiMessageCatalog(
+  defineUiMessageCatalog<TuiAttachmentsCopy>()(TUI_COPY_RESOURCES.attachments),
+);
+
+export function getTuiAttachmentsCopy(locale: UiLocale): TuiAttachmentsCopy {
+  return TUI_ATTACHMENTS_COPY[locale];
 }
 
 /**
