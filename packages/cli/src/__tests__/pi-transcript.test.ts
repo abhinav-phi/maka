@@ -18,6 +18,7 @@
  */
 
 import assert from 'node:assert/strict';
+import { buildBuiltinTools } from '@maka/runtime/builtin-tools';
 import { describe, test } from 'node:test';
 import { visibleWidth } from '@earendil-works/pi-tui';
 import type { PipeShellOutput, PtyShellOutput } from '@maka/core/shell-run';
@@ -42,6 +43,7 @@ import {
   makaPiToolPresentationStatus,
   retireCancelledTransientMessages,
   replaceTranscriptWithStoredMessages,
+  shortenCwd,
   submitCompactToTranscript,
   toggleAllThinkingExpansion,
   toggleAllToolExpansion,
@@ -53,6 +55,22 @@ function toolStatus(entry: MakaPiToolEntry | undefined): string | undefined {
 }
 
 describe('Maka Pi TUI transcript', () => {
+  test('hides a retired provider dropping note that an old session still carries', () => {
+    const state = createMakaPiTranscriptState();
+    replaceTranscriptWithStoredMessages(state, [
+      {
+        type: 'system_note',
+        id: 'drop-1',
+        turnId: 't1',
+        ts: 1,
+        kind: 'context_provider_dropping',
+        data: { inputTokens: 100, priorInputTokens: 100 },
+      },
+    ]);
+    const rendered = renderMakaPiTranscript(state, meta(), 120).map(stripAnsi).join('\n');
+    assert.doesNotMatch(rendered, /context_provider_dropping|truncated or rewritten/);
+  });
+
   test('renders manual compaction from the typed terminal outcome', async () => {
     for (const [outcome, expected] of [
       [{ kind: 'compacted' as const, checkpointId: 'checkpoint-1' }, 'Context compacted.'],
@@ -122,7 +140,7 @@ describe('Maka Pi TUI transcript', () => {
     assert.match(english, /Type a message to start/);
     assert.match(english, /\/session\s+Switch or resume a session/);
 
-    const chinese = renderMakaPiTranscript(state, { ...meta(), uiLocale: 'zh' }, 100)
+    const chinese = renderMakaPiTranscript(state, { ...meta(), uiLocale: 'zh-CN' }, 100)
       .map(stripAnsi)
       .join('\n');
     assert.match(chinese, /陪你把事做完/);
@@ -138,7 +156,7 @@ describe('Maka Pi TUI transcript', () => {
     state.steering = ['s'.repeat(250)];
     state.followup = ['f'.repeat(250)];
 
-    const lines = renderMakaPiPendingQueue(state, 400);
+    const lines = renderMakaPiPendingQueue(state, 400, process.platform, 'en');
     for (const line of lines) {
       assert.doesNotMatch(line, /[\r\n]/, `pending-queue row must be a single row: ${line}`);
     }
@@ -150,10 +168,14 @@ describe('Maka Pi TUI transcript', () => {
     const state = createMakaPiTranscriptState();
     state.steering = ['Keep going'];
     const renderFor = (platform: NodeJS.Platform) =>
-      renderMakaPiPendingQueue(state, 80, platform).map(stripAnsi);
+      renderMakaPiPendingQueue(state, 80, platform, 'en').map(stripAnsi);
 
-    assert.equal(renderFor('darwin').at(-1), '⌥+↑ 取回队列以重新编辑');
-    assert.equal(renderFor('linux').at(-1), 'Alt+↑ 取回队列以重新编辑');
+    assert.equal(renderFor('darwin').at(-1), '⌥+↑ take queued messages back to re-edit');
+    assert.equal(renderFor('linux').at(-1), 'Alt+↑ take queued messages back to re-edit');
+    assert.equal(
+      renderMakaPiPendingQueue(state, 80, 'linux', 'zh-CN').map(stripAnsi).at(-1),
+      'Alt+↑ 取回队列以重新编辑',
+    );
   });
 
   test('renders goal-origin prompts as autonomous provenance, not as user prompts', () => {
@@ -219,7 +241,7 @@ describe('Maka Pi TUI transcript', () => {
     assert.equal(
       stripAnsi(
         renderMakaPiStatusLine(
-          { ...meta(), uiLocale: 'zh', sideConversation: { view: 'side' } },
+          { ...meta(), uiLocale: 'zh-CN', sideConversation: { view: 'side' } },
           200,
         ),
       ),
@@ -238,7 +260,7 @@ describe('Maka Pi TUI transcript', () => {
           renderMakaPiStatusLine(
             {
               ...meta(),
-              uiLocale: 'zh',
+              uiLocale: 'zh-CN',
               sideConversation: { view: 'side', parentStatus },
             },
             200,
@@ -250,7 +272,7 @@ describe('Maka Pi TUI transcript', () => {
     assert.match(
       stripAnsi(
         renderMakaPiStatusLine(
-          { ...meta(), uiLocale: 'zh', sideConversation: { view: 'parent' } },
+          { ...meta(), uiLocale: 'zh-CN', sideConversation: { view: 'parent' } },
           200,
         ),
       ),
@@ -964,7 +986,6 @@ describe('Maka Pi TUI transcript', () => {
         turnId: 'turn-1',
         ts: 2,
         status: 'running',
-        partialOutputRetained: true,
       },
     ]);
 
@@ -1050,7 +1071,6 @@ describe('Maka Pi TUI transcript', () => {
         turnId: 'turn-1',
         ts: 5,
         status: 'completed',
-        partialOutputRetained: true,
       },
     ]);
 
@@ -1414,7 +1434,6 @@ describe('Maka Pi TUI transcript', () => {
         turnId: 'turn-1',
         ts: 2,
         status: 'completed',
-        partialOutputRetained: false,
       },
     ] satisfies StoredMessage[]);
 
@@ -2085,7 +2104,7 @@ describe('Maka Pi TUI transcript', () => {
     assert.ok(visibleLines.every((line) => !line.includes(' a ')));
   });
 
-  test('queues sandbox boundary and user-question requests in arrival order', () => {
+  test('queues sandbox boundary, question, and form requests in arrival order', () => {
     const state = createMakaPiTranscriptState();
     applyMakaSessionEventToTranscript(
       state,
@@ -2104,6 +2123,17 @@ describe('Maka Pi TUI transcript', () => {
     applyMakaSessionEventToTranscript(
       state,
       event({
+        type: 'form_request',
+        requestId: 'form-1',
+        toolUseId: 'tool-3',
+        message: 'Configure deployment',
+        requester: { name: 'deploy', source: 'Acme MCP' },
+        fields: [{ kind: 'boolean', name: 'notify', label: 'Notify', required: false }],
+      }),
+    );
+    applyMakaSessionEventToTranscript(
+      state,
+      event({
         type: 'user_question_request',
         requestId: 'question-1',
         toolUseId: 'tool-2',
@@ -2114,7 +2144,7 @@ describe('Maka Pi TUI transcript', () => {
     assert.equal(state.pendingInteraction?.requestId, 'boundary-1');
     assert.deepEqual(
       state.queuedInteractions.map((item) => item.requestId),
-      ['question-1'],
+      ['form-1', 'question-1'],
     );
 
     applyMakaSessionEventToTranscript(
@@ -2128,7 +2158,25 @@ describe('Maka Pi TUI transcript', () => {
         revision: 1,
       }),
     );
+    assert.equal(state.pendingInteraction?.requestId, 'form-1');
+    applyMakaSessionEventToTranscript(
+      state,
+      event({
+        type: 'form_answer_ack',
+        requestId: 'form-1',
+        toolUseId: 'tool-3',
+      }),
+    );
     assert.equal(state.pendingInteraction?.requestId, 'question-1');
+    applyMakaSessionEventToTranscript(
+      state,
+      event({
+        type: 'user_question_answer_ack',
+        requestId: 'question-1',
+        toolUseId: 'tool-2',
+      }),
+    );
+    assert.equal(state.pendingInteraction, undefined);
     assert.deepEqual(state.queuedInteractions, []);
   });
 
@@ -2596,7 +2644,7 @@ describe('Maka Pi TUI transcript', () => {
         type: 'tool_start',
         toolUseId: 'read-bg',
         toolName: 'Read',
-        args: { ref },
+        args: { path: ref },
       }),
     );
 
@@ -2859,12 +2907,84 @@ describe('Maka Pi TUI transcript', () => {
     assert.equal(poll?.toolUseId, 'read-bg');
     assert.equal(poll?.toolName, 'Read');
     assert.equal(toolStatus(poll), 'error');
-    const rendered = renderMakaPiTranscript(state, meta(), 100).map(stripAnsi).join('\n');
+    // Assert the semantic row after stripping ANSI, as it appears with
+    // NO_COLOR; the failure label must not depend on the red disc.
+    const rendered = renderMakaPiTranscript(state, meta(), 80).map(stripAnsi).join('\n');
     assert.match(rendered, /● Read/);
-    // The error disc carries the failure state; free-text error content stays
-    // out of the compact row under #1086.
-    assert.match(rendered, /\(1 line · 32 bytes\)/);
+    // The compact row names the failure even without ANSI color; free-text
+    // error content stays out of the row and remains available when expanded.
+    assert.match(rendered, /● Read.*\(failed\)/);
+    // Error-text size must not look like successfully read resource content.
+    assert.doesNotMatch(rendered, /32 bytes/);
     assert.doesNotMatch(rendered, /background task no longer exists/);
+    assert.ok(
+      visibleWidth(rendered.split('\n').find((line) => line.includes('● Read')) ?? '') <= 80,
+    );
+  });
+
+  test('keeps generic compact text outcomes distinct by real presentation status', () => {
+    const cases = [
+      {
+        id: 'generic-success',
+        toolName: 'mcp__local__result',
+        args: {},
+        isError: false,
+        content: { kind: 'text', text: 'ok\n' } as const,
+        expected: '(1 line · 3 bytes)',
+      },
+      {
+        id: 'generic-error',
+        toolName: 'mcp__local__result',
+        args: {},
+        isError: true,
+        content: { kind: 'text', text: 'failed because of a bad input' } as const,
+        expected: '(failed)',
+      },
+      {
+        id: 'subagent-failed',
+        toolName: 'agent_spawn',
+        args: { profile: 'local_read', task: 'read' },
+        isError: true,
+        content: subagentResult({ status: 'failed', summary: 'child failed' }),
+        expected: '(failed)',
+      },
+      {
+        id: 'subagent-aborted',
+        toolName: 'agent_spawn',
+        args: { profile: 'local_read', task: 'read' },
+        isError: true,
+        content: subagentResult({ status: 'cancelled', summary: 'child stopped' }),
+        expected: '(aborted)',
+      },
+    ];
+
+    for (const testCase of cases) {
+      const state = createMakaPiTranscriptState();
+      applyMakaSessionEventToTranscript(
+        state,
+        event({
+          type: 'tool_start',
+          toolUseId: testCase.id,
+          toolName: testCase.toolName,
+          args: testCase.args,
+        }),
+      );
+      applyMakaSessionEventToTranscript(
+        state,
+        event({
+          type: 'tool_result',
+          toolUseId: testCase.id,
+          isError: testCase.isError,
+          content: testCase.content,
+        }),
+      );
+
+      const rendered = renderMakaPiTranscript(state, meta(), 120).map(stripAnsi).join('\n');
+      assert.match(rendered, new RegExp(`\\(${testCase.expected.slice(1, -1)}\\)`));
+      if (testCase.expected === '(failed)' || testCase.expected === '(aborted)') {
+        assert.doesNotMatch(rendered, /bytes/);
+      }
+    }
   });
 
   test('surfaces a failed poll at the tail without rewriting scrollback', () => {
@@ -3812,7 +3932,7 @@ describe('Maka Pi TUI transcript', () => {
     );
   });
 
-  test('folds a background-task Read result into its parent Bash card', () => {
+  test('folds the real Read observation into its Bash card while the model gets a bounded page', async () => {
     const state = createMakaPiTranscriptState();
     const ref = 'maka://runtime/background-tasks/bg-1';
     applyMakaSessionEventToTranscript(
@@ -3839,21 +3959,41 @@ describe('Maka Pi TUI transcript', () => {
         type: 'tool_start',
         toolUseId: 'read-bg',
         toolName: 'Read',
-        args: { ref },
+        args: { path: ref },
       }),
     );
+    const observation = shellRun({
+      ref,
+      status: 'failed',
+      stdout: 'starting\n' + 'failure detail\n'.repeat(900),
+      updatedAt: 5_000,
+    });
+    const read = buildBuiltinTools({
+      runtimeResources: { readRuntimeResource: async () => observation },
+    }).find((tool) => tool.name === 'Read')!;
+    const args = { path: ref };
+    const result = await read.impl(args, {
+      sessionId: 'session-1',
+      turnId: 'turn-1',
+      toolCallId: 'read-bg',
+      cwd: '/repo',
+      abortSignal: new AbortController().signal,
+      emitOutput() {},
+    });
+    assert.deepEqual(result, observation);
+    const modelOutput = read.toModelOutput!({ toolCallId: 'read-bg', input: args, output: result });
+    assert.equal(modelOutput?.type, 'json');
+    if (modelOutput?.type === 'json') {
+      assert.ok(Buffer.byteLength(JSON.stringify(modelOutput.value)) <= 7_500);
+      assert.ok((modelOutput.value as { next: unknown }).next);
+    }
     applyMakaSessionEventToTranscript(
       state,
       event({
         type: 'tool_result',
         toolUseId: 'read-bg',
         isError: false,
-        content: shellRun({
-          ref,
-          status: 'running',
-          stdout: 'starting\nstill running\n',
-          updatedAt: 5_000,
-        }),
+        content: result as ToolResultContent,
       }),
     );
 
@@ -3864,14 +4004,15 @@ describe('Maka Pi TUI transcript', () => {
       tools[0]?.result?.kind === 'shell_run' && tools[0].result.output?.mode === 'pipes'
         ? tools[0].result.output.stdout
         : '',
-      'starting\nstill running\n',
+      observation.output?.mode === 'pipes' ? observation.output.stdout : '',
     );
+    assert.equal(tools[0]?.result?.kind === 'shell_run' && tools[0].result.status, 'failed');
     const rendered = renderMakaPiTranscript(state, meta(), 100).map(stripAnsi).join('\n');
     assert.doesNotMatch(rendered, /● Read/);
     // Running card keeps the live tail in the expanded card.
     assert.equal(toggleAllToolExpansion(state), true);
     const expanded = renderMakaPiTranscript(state, meta(), 100).map(stripAnsi).join('\n');
-    assert.match(expanded, /still running/);
+    assert.match(expanded, /failure detail/);
   });
 
   test('shows polled background output instead of a stale live delta', () => {
@@ -4284,6 +4425,102 @@ describe('Maka Pi TUI transcript', () => {
     assert.match(rendered, /\$ git status --porcelain/);
     // Once the row names the call, the quiet-success disclaimer is noise.
     assert.doesNotMatch(rendered, /\(no output\)/);
+  });
+
+  test('keeps todo_write arguments quiet and shows only its settled snapshot', () => {
+    const state = createMakaPiTranscriptState();
+    applyMakaSessionEventToTranscript(
+      state,
+      event({
+        type: 'tool_start',
+        toolUseId: 'todo-write',
+        toolName: 'todo_write',
+        displayName: 'Todo Write',
+        args: undefined,
+        argsPreview: undefined,
+      }),
+    );
+
+    const running = renderMakaPiTranscript(state, meta(), 80).map(stripAnsi).join('\n');
+    assert.match(running, /Todo Write/);
+    assert.doesNotMatch(running, /uncommitted item/);
+
+    applyMakaSessionEventToTranscript(
+      state,
+      event({
+        type: 'tool_result',
+        toolUseId: 'todo-write',
+        isError: false,
+        content: {
+          kind: 'text',
+          text: 'Todo list updated.\n1. [in_progress] committed item',
+        },
+      }),
+    );
+
+    const settled = renderMakaPiTranscript(state, meta(), 80).map(stripAnsi).join('\n');
+    assert.match(settled, /Todo Write/);
+    assert.match(settled, /2 lines/);
+    assert.equal(toggleAllToolExpansion(state), true);
+    assert.match(
+      renderMakaPiTranscript(state, meta(), 80).map(stripAnsi).join('\n'),
+      /committed item/,
+    );
+  });
+
+  test('never restores todo_write arguments from durable transcript reconciliation', () => {
+    const messages = [
+      {
+        type: 'tool_call',
+        id: 'todo-write',
+        turnId: 'turn-1',
+        ts: 1,
+        toolName: 'todo_write',
+        displayName: 'Todo Write',
+        args: { todos: [{ content: 'uncommitted item', status: 'pending' }] },
+      },
+      {
+        type: 'tool_result',
+        id: 'todo-result',
+        turnId: 'turn-1',
+        ts: 2,
+        toolUseId: 'todo-write',
+        isError: false,
+        content: {
+          kind: 'text',
+          text: 'Todo list updated (1 items):\n1. [in_progress] "committed item"',
+        },
+      },
+    ] satisfies StoredMessage[];
+
+    for (const reconcile of [
+      (state: ReturnType<typeof createMakaPiTranscriptState>) =>
+        replaceTranscriptWithStoredMessages(state, messages),
+      (state: ReturnType<typeof createMakaPiTranscriptState>) => {
+        applyMakaSessionEventToTranscript(
+          state,
+          event({
+            type: 'tool_start',
+            toolUseId: 'todo-write',
+            toolName: 'todo_write',
+            displayName: 'Todo Write',
+            args: undefined,
+          }),
+        );
+        hydrateToolsWithStoredMessages(state, 'turn-1', messages);
+      },
+    ]) {
+      const state = createMakaPiTranscriptState();
+      reconcile(state);
+      const tool = state.entries.find(
+        (entry) => entry.kind === 'tool' && entry.toolUseId === 'todo-write',
+      );
+      assert.deepEqual(tool?.kind === 'tool' ? tool.input : undefined, {});
+      assert.equal(toggleAllToolExpansion(state), true);
+      const rendered = renderMakaPiTranscript(state, meta(), 80).map(stripAnsi).join('\n');
+      assert.match(rendered, /committed item/);
+      assert.doesNotMatch(rendered, /uncommitted item/);
+    }
   });
 
   test('prefers a redacted runtime intent for a live compact row', () => {
@@ -4999,7 +5236,6 @@ function inFlightBackgroundPollFixture(): {
         turnId: 'turn-1',
         ts: 1,
         status: 'running',
-        partialOutputRetained: true,
       },
       { type: 'tool_call', id: 'bash-bg', turnId: 'turn-1', ts: 2, toolName: 'Bash', args: {} },
       {
@@ -5041,3 +5277,46 @@ function subagentResult(
 function stripAnsi(text: string): string {
   return text.replace(/\x1b\[[0-9;]*m/g, '');
 }
+
+describe('shortenCwd', () => {
+  test('shortens POSIX paths under the home directory', {
+    skip: process.platform === 'win32',
+  }, () => {
+    assert.equal(shortenCwd('/Users/alice/work/project', '/Users/alice'), '~/work/project');
+    assert.equal(shortenCwd('/Users/alice/..\\notes', '/Users/alice'), '~/..\\notes');
+    assert.equal(shortenCwd('/Users/alice', '/Users/alice'), '~');
+  });
+
+  test('keeps POSIX paths outside the home directory absolute', {
+    skip: process.platform === 'win32',
+  }, () => {
+    assert.equal(shortenCwd('/Users/alice-shared', '/Users/alice'), '/Users/alice-shared');
+    assert.equal(shortenCwd('/Users', '/Users/alice'), '/Users');
+    assert.equal(shortenCwd('/tmp/project', '/Users/alice'), '/tmp/project');
+  });
+
+  test('shortens Windows profile paths (#3825)', { skip: process.platform !== 'win32' }, () => {
+    assert.equal(shortenCwd('C:\\Users\\alice\\Videos', 'C:\\Users\\alice'), '~/Videos');
+    assert.equal(
+      shortenCwd('C:\\Users\\alice\\Videos\\Clips', 'C:\\Users\\alice'),
+      '~/Videos\\Clips',
+    );
+    assert.equal(shortenCwd('C:\\Users\\alice', 'C:\\Users\\alice'), '~');
+  });
+
+  test('shortens Windows profile paths with case-only differences (#3825)', {
+    skip: process.platform !== 'win32',
+  }, () => {
+    assert.equal(shortenCwd('c:\\users\\alice\\videos', 'C:\\Users\\alice'), '~/videos');
+  });
+
+  test('keeps Windows paths outside the profile directory absolute (#3825)', {
+    skip: process.platform !== 'win32',
+  }, () => {
+    assert.equal(
+      shortenCwd('C:\\Users\\alice-shared', 'C:\\Users\\alice'),
+      'C:\\Users\\alice-shared',
+    );
+    assert.equal(shortenCwd('D:\\data\\project', 'C:\\Users\\alice'), 'D:\\data\\project');
+  });
+});

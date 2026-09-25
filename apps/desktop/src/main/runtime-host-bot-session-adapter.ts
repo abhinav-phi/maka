@@ -76,7 +76,7 @@ export function createRuntimeHostBotSessionAdapter(
           name: input.name,
           labels: [...input.labels],
           modelTarget: { kind: 'default' },
-          permissionMode: 'explore',
+          mode: 'bot',
         });
       } catch (error) {
         if (
@@ -140,6 +140,9 @@ export function createRuntimeHostBotSessionAdapter(
       void completion.catch(() => undefined);
       try {
         try {
+          // The Host holds this subscription's frames until here, so the reply
+          // has to be collectable before the Turn that produces it starts.
+          await session.ready();
           const started = await deps.client.startTurn({
             sessionId,
             turnId,

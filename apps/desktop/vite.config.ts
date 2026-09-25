@@ -23,6 +23,8 @@ import { dirname, resolve } from 'node:path';
 import react from '@vitejs/plugin-react';
 import { dependencyPatchesCachePlugin } from './vite-dependency-patches.js';
 import { bundledNpmPackagesPlugin } from './vite-bundled-packages.js';
+import { rendererEntryContractPlugin } from './scripts/vite-renderer-entry-contract.js';
+import { workspacePackagesPlugin } from './vite-workspace-packages.js';
 
 /**
  * PR-ICONS-FULL-REPLACE-0 (WAWQAQ msg `60064e2d` 2026-06-24): point the
@@ -42,13 +44,20 @@ export default defineConfig({
   // Vite hashes plugin names into its dependency-cache key. patch-package does
   // not change package-lock.json, so carry the patch contents in that key while
   // keeping every Astryx entry in one optimized module graph.
-  plugins: [react(), dependencyPatchesCachePlugin(REPO_ROOT), bundledNpmPackagesPlugin()],
+  plugins: [
+    react(),
+    dependencyPatchesCachePlugin(REPO_ROOT),
+    workspacePackagesPlugin(REPO_ROOT),
+    bundledNpmPackagesPlugin(),
+    rendererEntryContractPlugin(resolve(import.meta.dirname, 'src/renderer')),
+  ],
   resolve: {
     dedupe: ['react', 'react-dom'],
     alias: [
+      { find: '@maka/ui/client-plugin-runtime', replacement: resolve(UI_SRC, 'client-plugin-runtime.tsx') },
+      { find: '@maka/ui/client-plugin', replacement: resolve(UI_SRC, 'client-plugin-slots.tsx') },
       { find: '@maka/ui/icons', replacement: resolve(UI_SRC, 'icons.tsx') },
       { find: '@maka/ui/artifact-preview-registry', replacement: resolve(UI_SRC, 'artifact-preview-registry.ts') },
-      { find: '@maka/ui/assistant-stream', replacement: resolve(UI_SRC, 'assistant-stream.ts') },
       { find: '@maka/ui/maka-uri', replacement: resolve(UI_SRC, 'maka-uri.ts') },
       { find: /^@maka\/ui$/, replacement: resolve(UI_SRC, 'index.ts') },
     ],

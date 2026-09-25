@@ -17,10 +17,10 @@
  * under the License.
  */
 
-import { app, BrowserWindow, dialog, nativeTheme, screen, shell } from 'electron';
+import { MAIN_WINDOW_DROP_GUARD_SCRIPT } from './main-window-drop-guard.js';
+import { app, BrowserWindow, dialog, nativeTheme, screen, shell, type View, webFrameMain } from 'electron';
 import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
 import { appIconForTheme, type AppSettings } from '@maka/core/settings';
 import { readableAppIconPath } from './app-icon-surface.js';
 import { isExternalUrl } from './external-link-guard.js';
@@ -29,9 +29,15 @@ import { BrowserViewController } from './browser/controller.js';
 import { BrowserViewManager } from './browser/view-manager.js';
 import type { E2eFixture } from './e2e-fixture.js';
 import { installMainWindowPermissionPolicy } from './main-window-permission-policy.js';
-import { observeMainRendererProcessGone } from './main-renderer-process-gone.js';
+import { loadMainRenderer, resolveMainRendererEntry } from './main-renderer-loader.js';
+import { clearDevRendererHttpCache } from './main-renderer-dev-cache.js';
+import {
+  type MainRendererFrameIdentity,
+  observeMainRendererProcessGone,
+  reloadMainRendererProcess,
+} from './main-renderer-process-gone.js';
 import { isDarkAppearance, isThemePreference, toNativeThemeSource } from './theme-source.js';
-import { createWindowRevealGate } from './window-reveal.js';
+import { createWindowRevealGate, type WindowRevealMode } from './window-reveal.js';
 import { createWindowsMaximizeRendererSync } from './windows-maximize-renderer-sync.js';
 import {
   parseDesktopSessionResourceKey,
@@ -43,10 +49,24 @@ type SettingsReader = {
 
 export interface MainWindowController {
   createWindow(signal: AbortSignal): Promise<void>;
+  /**
+   * Reload only the crashed main Renderer, preserving the Desktop process,
+   * Runtime Host, background services, and current BrowserWindow.
+   */
+  reloadMainRenderer(): Promise<boolean>;
   send(channel: string, ...args: unknown[]): void;
+  /** Subscribe an app-owned renderer to existing application broadcasts. */
+  registerAuxiliaryRenderer(contents: Electron.WebContents, parent?: View): () => void;
+  ownsRenderer(contents: Electron.WebContents): boolean;
+  isMainRenderer(contents: Electron.WebContents): boolean;
+  browserParentForRenderer(contents: Electron.WebContents): View | undefined;
+  setBrowserViewParentResolver(resolve: (sessionId: string) => View | undefined): void;
   // PR-SHOW-AFTER-FIRST-COMMIT: reveal the hidden window after the renderer's
   // first React commit. Idempotent + e2e-fixture-safe (see notifyRendererReady).
-  notifyRendererReady(): void;
+  notifyRendererReady(
+    sender: Electron.WebContents,
+    senderFrame: Electron.WebFrameMain | null,
+  ): void;
   setTitlebarControlsVisible(sender: Electron.WebContents, visible: unknown): void;
   setThemeSource(sender: Electron.WebContents, themePref: unknown): void;
   setTitleBarOverlayTheme(sender: Electron.WebContents, theme: unknown): void;
@@ -85,31 +105,52 @@ interface MainWindowControllerDeps {
   settingsStore: SettingsReader;
   // main.ts computes this from the same isE2e gate that also guards userData
   // and the fake backend, so main-window.ts owns no env policy of its own.
-  startHidden: boolean;
+  revealMode: WindowRevealMode;
   onClose?: () => void;
+  onClosed?: () => void;
   onRendererProcessGone: (details: Electron.RenderProcessGoneDetails) => void | Promise<void>;
+  // Fires right after `new BrowserWindow` — main.ts defers the heavy Runtime
+  // Host module graph until this point so its evaluation cannot starve the
+  // window's async prelude (mkdir/bounds/settings) on the shared main thread.
+  onWindowConstructed?: () => void;
 }
 
 let mainWindow: BrowserWindow | null = null;
+const auxiliaryRenderers = new Map<Electron.WebContents, View | undefined>();
+
+function registerAuxiliaryRenderer(contents: Electron.WebContents, parent?: View): () => void {
+  if (contents.isDestroyed()) return () => undefined;
+  auxiliaryRenderers.set(contents, parent);
+  const release = () => {
+    auxiliaryRenderers.delete(contents);
+    contents.removeListener('destroyed', release);
+  };
+  contents.once('destroyed', release);
+  return release;
+}
+
+function browserParentForRenderer(contents: Electron.WebContents): View | undefined {
+  if (contents.isDestroyed()) return undefined;
+  if (mainWindow && !mainWindow.isDestroyed() && contents === mainWindow.webContents) {
+    return mainWindow.contentView;
+  }
+  return auxiliaryRenderers.get(contents);
+}
+
+function ownsRenderer(contents: Electron.WebContents): boolean {
+  if (contents.isDestroyed()) return false;
+  return (!!mainWindow && !mainWindow.isDestroyed() && contents === mainWindow.webContents)
+    || auxiliaryRenderers.has(contents);
+}
 let browserViews: BrowserViewManager<BrowserViewController> | undefined;
 
-/**
- * Guarded `webContents.send` for `mainWindow`. The `mainWindow?.` optional
- * chain only covers a null reference — it does NOT catch the case where the
- * BrowserWindow has been destroyed (window closed, renderer crashed,
- * teardown raced) while the variable still points at the freed object.
- * Calling `.webContents.send` in that state throws `TypeError: Object has
- * been destroyed`, surfacing as a main-process JS-error dialog.
- *
- * Use this helper anywhere a timer / IPC / menu accelerator might race
- * window teardown. No-op when the window is gone — callers that need
- * delivery confirmation should observe their own state.
- */
+/** Broadcast existing app events once to each live owned renderer, even if the main window is closed. */
 export function safeSendToRenderer(channel: string, ...args: unknown[]): void {
-  if (!mainWindow || mainWindow.isDestroyed()) return;
-  const wc = mainWindow.webContents;
-  if (wc.isDestroyed()) return;
-  wc.send(channel, ...args);
+  const recipients = new Set(auxiliaryRenderers.keys());
+  if (mainWindow && !mainWindow.isDestroyed()) recipients.add(mainWindow.webContents);
+  for (const contents of recipients) {
+    if (!contents.isDestroyed()) contents.send(channel, ...args);
+  }
 }
 
 // The close button's centre sits on the same vertical line as the sidebar's
@@ -123,11 +164,11 @@ const MAIN_WINDOW_TRAFFIC_LIGHT_POSITION = { x: 17, y: 14 } as const;
 const HIDDEN_TRAFFIC_LIGHT_POSITION = { x: -100, y: -100 } as const;
 
 // PR-SHOW-AFTER-FIRST-COMMIT: fallback reveal delay for a renderer that never
-// signals its first painted frame (window:notifyRendererReady). main.tsx's
-// onboarding prefetch bails at 2500ms; the remainder is headroom for React +
-// first paint. The timer is armed only after loadURL/loadFile resolves, so
-// Vite compilation and document loading do not consume this budget, while a
-// wedged renderer still cannot leave the window invisible forever.
+// signals its first painted frame (window:notifyRendererReady). The budget
+// covers React mount + first paint headroom. The timer is armed only after
+// loadURL/loadFile resolves, so Vite compilation and document loading do not
+// consume this budget, while a wedged renderer still cannot leave the window
+// invisible forever.
 const SHOW_FALLBACK_TIMEOUT_MS = 4000;
 
 // PR-WINDOW-TITLEBAR-0: the titleBarOverlay height matches the renderer
@@ -153,36 +194,71 @@ const titleBarOverlayOptions = (
 });
 
 export function createMainWindowController(deps: MainWindowControllerDeps): MainWindowController {
-  const { workspaceRoot, e2eFixture, settingsStore, startHidden } = deps;
+  const { workspaceRoot, e2eFixture, settingsStore } = deps;
   const liveBrowserScopes = new Map<string, { hostId: string; targetEpoch: string }>();
+  let browserViewParentResolver: ((sessionId: string) => View | undefined) | undefined;
 
-  // PR-SHOW-AFTER-FIRST-COMMIT: windows launched hidden (startHidden covers
+  // PR-SHOW-AFTER-FIRST-COMMIT: windows launched hidden (`hidden` covers
   // e2e-fixture capture and E2E — see main.ts) must never be revealed;
   // e2e-fixture captures run on the hidden window and E2E drives it headless.
-  // `!app.isPackaged` mirrors the original creation-time gate so a packaged
-  // build ignores a stray startHidden flag. The fallback timer, the
-  // renderer-ready IPC, and focus() all route their show() through this
-  // predicate via the reveal gate below.
-  const keepHiddenForE2eFixture = !app.isPackaged && startHidden;
+  // A run that asked for a visible window is `inactive`: it reveals, but never
+  // activates the app. The fallback timer, the renderer-ready IPC, and focus()
+  // all route their show() through this mode via the reveal gate below.
+  const revealMode: WindowRevealMode = deps.revealMode;
   // ChatGPT Pro review P2: focus() (second-instance / activate) used to call
   // mainWindow.show() directly, bypassing the reveal gate — re-launching or
-  // clicking the dock icon during the pre-commit window would flash the
-  // skeleton anyway. The gate defers those focus requests until markReady.
-  const revealGate = createWindowRevealGate(keepHiddenForE2eFixture);
+  // clicking the dock icon before the first paint would flash the bare
+  // vibrancy window anyway. The gate defers those focus requests until
+  // markReady.
+  const revealGate = createWindowRevealGate(revealMode);
   let showFallbackTimer: NodeJS.Timeout | undefined;
+  let rendererRecoveryReadiness:
+    | {
+        readonly contents: Electron.WebContents;
+        listener?: (frame: MainRendererFrameIdentity) => boolean;
+      }
+    | undefined;
+  let mainWindowShutdownSignal: AbortSignal | undefined;
   const clearShowFallbackTimer = (): void => {
     if (showFallbackTimer) {
       clearTimeout(showFallbackTimer);
       showFallbackTimer = undefined;
     }
   };
+  const armShowFallbackTimer = (target: BrowserWindow): void => {
+    clearShowFallbackTimer();
+    if (revealMode === 'hidden' || target.isDestroyed() || target.isVisible()) return;
+    showFallbackTimer = setTimeout(() => {
+      showFallbackTimer = undefined;
+      if (!target.isDestroyed()) revealGate.markReady(target);
+    }, SHOW_FALLBACK_TIMEOUT_MS);
+  };
+
+  const observeRendererProcess = (target: BrowserWindow, signal: AbortSignal): void => {
+    observeMainRendererProcessGone({
+      source: target.webContents,
+      shutdownSignal: signal,
+      onUnexpectedExit: (details) => {
+        console.error(
+          `[renderer] main Renderer process exited unexpectedly: reason=${details.reason} exitCode=${details.exitCode}`,
+        );
+        void Promise.resolve()
+          .then(() => deps.onRendererProcessGone(details))
+          .catch((error) => {
+            console.error('[renderer] failed to handle main Renderer process exit:', error);
+            app.quit();
+          });
+      },
+    });
+  };
 
   function getBrowserViews(): BrowserViewManager<BrowserViewController> {
     if (!browserViews) {
       browserViews = new BrowserViewManager<BrowserViewController>({
         create: (sessionId) => {
-          if (!mainWindow) throw new Error('Embedded browser used before the window is ready.');
-          return new BrowserViewController(mainWindow, sessionId, (sid, state) => {
+          const parent = browserViewParentResolver?.(sessionId);
+          if (!parent) throw new Error('Embedded browser used without an active renderer parent.');
+          return new BrowserViewController(parent, sessionId, (sid, state) => {
             const ref = parseDesktopSessionResourceKey(sid);
             safeSendToRenderer(
               'browser:state',
@@ -228,28 +304,23 @@ export function createMainWindowController(deps: MainWindowControllerDeps): Main
 
   async function createWindow(signal: AbortSignal): Promise<void> {
     if (signal.aborted) return;
-    await mkdir(workspaceRoot, { recursive: true });
     // Restore previously-saved bounds when available; first launch and
     // legacy installs both fall back to the default 1240x820 frame. After
     // load, validate the saved x/y against the current display layout — if
     // the previous external monitor is gone, drop x/y so Electron centers
     // the window on the primary display instead of opening it off-screen.
     const defaults = e2eFixtureWindowBounds(e2eFixture, { width: 1240, height: 820 });
-    const savedBounds = e2eFixture
-      ? defaults
-      : await readSavedBounds(workspaceRoot, defaults);
+    // mkdir, saved-bounds and the persisted appearance are independent reads —
+    // serialized they cost ~200ms ahead of the window constructor, so run them
+    // together. The FOUC fix below needs the appearance to pick the right
+    // backgroundColor (PR103 / PR-IR-01b: e2e-fixture theme wins over the
+    // persisted pref), which is why it cannot leave the critical path.
+    const [, savedBounds, persistedAppearance] = await Promise.all([
+      mkdir(workspaceRoot, { recursive: true }),
+      e2eFixture ? Promise.resolve(defaults) : readSavedBounds(workspaceRoot, defaults),
+      settingsStore.get().then((settings) => settings.appearance),
+    ]);
     const bounds = clampBoundsToVisibleDisplay(savedBounds);
-
-    // @kenji PR103 follow-up: complete the FOUC fix at the window-chrome layer.
-    // The renderer applies `.dark` synchronously before React mounts (PR103),
-    // but the BrowserWindow's `backgroundColor` shows during the first frame
-    // before the renderer paints. Pick the right initial bg by reading the
-    // persisted theme + system preference.
-    // PR-IR-01b: e2e-fixture theme override wins over the persisted user
-    // pref. This guarantees the BrowserWindow backgroundColor matches the
-    // theme variant we're about to screenshot, so the very first frame
-    // doesn't capture a light-on-dark or dark-on-light flash.
-    const persistedAppearance = (await settingsStore.get()).appearance;
     const persistedTheme = persistedAppearance?.theme ?? 'auto';
     // Quit cleanup permanently closes process-scoped stores. Re-check after
     // asynchronous preparation so an in-flight request cannot attach a new
@@ -265,15 +336,10 @@ export function createMainWindowController(deps: MainWindowControllerDeps): Main
     // disagrees with the persisted in-app preference.
     nativeTheme.themeSource = toNativeThemeSource(themePref);
 
-    const rendererEntryPath = join(
+    const rendererEntry = resolveMainRendererEntry(
       import.meta.dirname,
-      '..',
-      '..',
-      'dist-renderer',
-      'index.html',
+      process.env.VITE_DEV_SERVER_URL,
     );
-    const rendererEntryUrl = process.env.VITE_DEV_SERVER_URL
-      ?? pathToFileURL(rendererEntryPath).href;
 
     // Re-arm the reveal gate for this window's lifecycle (macOS keeps the app
     // alive after close-all; the next createWindow starts hidden again and a
@@ -349,13 +415,9 @@ export function createMainWindowController(deps: MainWindowControllerDeps): Main
       // drift apart (locked by app-region-hygiene-contract.test.ts).
       minHeight: SAFE_MIN_HEIGHT,
       backgroundColor: initialBg,
-      // PR-SHOW-AFTER-FIRST-COMMIT: create hidden on every run so the OS never
-      // flashes the index.html `.maka-preload` skeleton before React paints.
-      // The renderer signals `window:notifyRendererReady` after its first
-      // commit (app.tsx) and a fallback timer below reveals the window if that
-      // signal never arrives; the reveal gate (showWindowOnceReady) keeps the
-      // window hidden until the first real content can paint, so the app
-      // never flashes the `.maka-preload` skeleton past it.
+      // The window stays hidden until `ready-to-show`, so the first visible
+      // frame is already the launch surface — showing it at construction
+      // would expose the translucent vibrancy material before the DOM paints.
       show: false,
       // Native sidebar vibrancy lets the CSS-side sidebar render
       // transparent and inherit the system's blurred window material
@@ -379,22 +441,19 @@ export function createMainWindowController(deps: MainWindowControllerDeps): Main
         allowRunningInsecureContent: false,
       },
     });
-    observeMainRendererProcessGone({
-      source: mainWindow.webContents,
-      shutdownSignal: signal,
-      onUnexpectedExit: (details) => {
-        console.error(
-          `[renderer] main Renderer process exited unexpectedly: reason=${details.reason} exitCode=${details.exitCode}`,
-        );
-        void Promise.resolve()
-          .then(() => deps.onRendererProcessGone(details))
-          .catch((error) => {
-            console.error('[renderer] failed to handle main Renderer process exit:', error);
-            app.quit();
-          });
-      },
+    mainWindowShutdownSignal = signal;
+    observeRendererProcess(mainWindow, signal);
+    deps.onWindowConstructed?.();
+    // The designed `.maka-preload` surface is the loading UI: reveal on the
+    // first painted frame instead of waiting out the whole React mount.
+    // markReady is mode-suppressed (hidden/inactive) and idempotent, so the
+    // later `window:notifyRendererReady` signal and the fallback timer stay
+    // as no-op backstops.
+    mainWindow.once('ready-to-show', () => {
+      clearShowFallbackTimer();
+      revealGate.markReady(mainWindow);
     });
-    installMainWindowPermissionPolicy(mainWindow.webContents, rendererEntryUrl);
+    installMainWindowPermissionPolicy(mainWindow.webContents, rendererEntry.url);
 
     // Two-layer external-link hygiene: assistant markdown often emits `<a href>`
     // links to docs / GitHub / provider sign-up pages. Without these guards
@@ -434,30 +493,19 @@ export function createMainWindowController(deps: MainWindowControllerDeps): Main
     // BrowserWindow tries to navigate to its `file://` URL; the `will-navigate`
     // handler above stops the navigation, but the visual flash + dropEffect
     // ambiguity is still confusing. Suppressing dragover/drop at the document
-    // level keeps the chat surface immutable to accidental drops.
+    // level blocks accidental drops while designated application targets remain usable.
     mainWindow.webContents.on('did-finish-load', () => {
-      mainWindow?.webContents.executeJavaScript(`
-        (() => {
-          const block = (e) => {
-            const target = e.target instanceof Element ? e.target : e.target?.parentElement;
-            if (target?.closest('[data-maka-file-drop-target="true"]')) return;
-            e.preventDefault();
-            e.stopPropagation();
-          };
-          window.addEventListener('dragover', block, true);
-          window.addEventListener('drop', block, true);
-        })();
-      `).catch(() => { /* renderer may not be ready; ignore */ });
+      mainWindow?.webContents.executeJavaScript(MAIN_WINDOW_DROP_GUARD_SCRIPT).catch(() => {
+        /* renderer may not be ready; ignore */
+      });
     });
 
     // Restore maximized state after construction (BrowserWindow constructor
     // doesn't accept it directly). ChatGPT Pro review P2 (round 2): a direct
-    // maximize() here reveals the still-hidden window (verified on macOS),
-    // bypassing the reveal gate — defer it so markReady applies it right
-    // before the reveal and the first visible frame is already maximized.
-    if (bounds.isMaximized) {
-      revealGate.requestMaximize(mainWindow);
-    }
+    // maximize() reveals a still-hidden window (verified on macOS), so all
+    // reveal modes defer it to markReady and the first visible frame is
+    // already maximized.
+    if (bounds.isMaximized) revealGate.requestMaximize(mainWindow);
 
     // Persist bounds across launches. Debounce so a continuous resize drag
     // doesn't write the file on every frame; flush on close.
@@ -486,35 +534,29 @@ export function createMainWindowController(deps: MainWindowControllerDeps): Main
       clearShowFallbackTimer();
       deps.onClose?.();
       if (saveTimer) clearTimeout(saveTimer);
-      // The window owns the embedded-browser views (children of its contentView);
-      // tear them down so their WebContents close with it instead of leaking.
-      void browserViews?.disposeAll();
       if (!mainWindow) return;
       const final: SavedBounds = mainWindow.isMaximized()
         ? { ...mainWindow.getNormalBounds(), isMaximized: true }
         : { ...mainWindow.getBounds(), isMaximized: false };
       void writeSavedBounds(workspaceRoot, final);
     });
+    mainWindow.once('closed', () => deps.onClosed?.());
 
-    if (process.env.VITE_DEV_SERVER_URL) {
-      await mainWindow.loadURL(rendererEntryUrl);
-    } else {
-      await mainWindow.loadFile(rendererEntryPath);
-    }
+    // Dev-server cache hygiene (issue #4775) — see main-renderer-dev-cache.ts
+    // for why a stale immutable dep-chunk graph must never survive into a new
+    // dev session (duplicate React instances → null hook dispatcher crash).
+    await clearDevRendererHttpCache(mainWindow.webContents.session, rendererEntry);
+
+    await loadMainRenderer(mainWindow, rendererEntry);
 
     // PR-SHOW-AFTER-FIRST-COMMIT: reveal fallback. Start this budget only once
     // the renderer document has loaded. Starting it before loadURL/loadFile
     // let a cold Vite transform or slow disk consume the whole timeout and
-    // reveal index.html's preload skeleton before React had a chance to paint.
+    // reveal index.html's launch overlay before React had a chance to paint.
     // If renderer-ready arrived while loadURL/loadFile was resolving, the
     // window is already visible and no timer is needed. E2e-fixture windows
     // remain hidden for their whole lifecycle.
-    if (!keepHiddenForE2eFixture && !mainWindow.isVisible()) {
-      showFallbackTimer = setTimeout(() => {
-        showFallbackTimer = undefined;
-        revealGate.markReady(mainWindow);
-      }, SHOW_FALLBACK_TIMEOUT_MS);
-    }
+    armShowFallbackTimer(mainWindow);
     if (process.env.MAKA_REAL_WINDOW_SMOKE === '1') {
       emitRealWindowSmokeDiagnostic('after-load');
       setTimeout(() => emitRealWindowSmokeDiagnostic('settled-1000ms'), 1000);
@@ -523,8 +565,84 @@ export function createMainWindowController(deps: MainWindowControllerDeps): Main
 
   return {
     createWindow,
+    async reloadMainRenderer() {
+      const target = mainWindow;
+      const signal = mainWindowShutdownSignal;
+      if (
+        !target ||
+        target.isDestroyed() ||
+        target.webContents.isDestroyed() ||
+        !signal ||
+        signal.aborted
+      ) return false;
+      clearShowFallbackTimer();
+      revealGate.reset();
+      target.hide();
+      const contents = target.webContents;
+      const readiness: {
+        readonly contents: Electron.WebContents;
+        listener?: (frame: MainRendererFrameIdentity) => boolean;
+      } = { contents };
+      rendererRecoveryReadiness = readiness;
+      let loaded = false;
+      try {
+        loaded = await reloadMainRendererProcess({
+          source: contents,
+          shutdownSignal: signal,
+          subscribeMainFrameCommitted: (listener) => {
+            const onFrameNavigated = (
+              _event: Electron.Event,
+              _url: string,
+              _httpResponseCode: number,
+              _httpStatusText: string,
+              isMainFrame: boolean,
+              frameProcessId: number,
+              frameRoutingId: number,
+            ): void => {
+              if (!isMainFrame) return;
+              const frame = webFrameMain.fromId(frameProcessId, frameRoutingId);
+              if (frame) listener(rendererFrameIdentity(frame));
+            };
+            contents.on('did-frame-navigate', onFrameNavigated);
+            return () => contents.off('did-frame-navigate', onFrameNavigated);
+          },
+          subscribeRendererReady: (listener) => {
+            readiness.listener = listener;
+            return () => {
+              if (readiness.listener === listener) readiness.listener = undefined;
+            };
+          },
+          onReady: () => {
+            // The previous one-shot observer was consumed by the crash. Re-arm
+            // it before successful recovery is exposed to the caller.
+            observeRendererProcess(target, signal);
+          },
+        });
+        if (!loaded) console.error('[renderer] main Renderer reload did not become ready');
+        return loaded;
+      } finally {
+        if (rendererRecoveryReadiness === readiness) {
+          if (loaded) rendererRecoveryReadiness = undefined;
+          else readiness.listener = undefined;
+        }
+      }
+    },
     send: safeSendToRenderer,
-    notifyRendererReady() {
+    registerAuxiliaryRenderer,
+    ownsRenderer,
+    browserParentForRenderer,
+    isMainRenderer: (contents) => !!mainWindow && !mainWindow.isDestroyed() && mainWindow.webContents === contents,
+    setBrowserViewParentResolver(resolve) {
+      browserViewParentResolver = resolve;
+    },
+    notifyRendererReady(sender, senderFrame) {
+      if (!mainWindow || mainWindow.isDestroyed() || sender !== mainWindow.webContents) return;
+      const recovery = rendererRecoveryReadiness;
+      if (recovery?.contents === sender) {
+        // A failed attempt stays as a tombstone, and a retry accepts ready only
+        // from the main frame committed by that exact reload navigation.
+        if (!senderFrame || !recovery.listener?.(rendererFrameIdentity(senderFrame))) return;
+      }
       // PR-SHOW-AFTER-FIRST-COMMIT: the renderer finished its first React
       // commit. Cancel the fallback timer and reveal the window through the
       // shared gate — idempotent, so an HMR reload re-firing this signal (or a
@@ -602,15 +720,22 @@ export function createMainWindowController(deps: MainWindowControllerDeps): Main
     },
     focus() {
       // ChatGPT Pro review P2: second-instance / activate must not show() the
-      // still-hidden window ahead of the renderer's first commit — that would
-      // flash the `.maka-preload` skeleton past the reveal gate. The gate
-      // defers the request and flushes it (restore+show+focus) on markReady;
-      // after that, focus behaves exactly as before.
+      // still-hidden window before it has painted — that would flash an
+      // unpainted frame past the reveal gate. The gate defers the request
+      // and flushes it (restore+show+focus) on markReady; after that, focus
+      // behaves exactly as before.
       revealGate.requestFocus(mainWindow);
     },
     isFocused() {
       return !!mainWindow && !mainWindow.isDestroyed() && mainWindow.isFocused();
     },
+  };
+}
+
+function rendererFrameIdentity(frame: Electron.WebFrameMain): MainRendererFrameIdentity {
+  return {
+    processId: frame.processId,
+    frameToken: frame.frameToken,
   };
 }
 
@@ -705,7 +830,7 @@ function emitRealWindowSmokeDiagnostic(stage: string): void {
         bodyTextSample: document.body?.innerText?.trim().slice(0, 240) ?? '',
         stylesheetCount: document.styleSheets.length,
         rootChildren: document.getElementById('root')?.children.length ?? 0,
-        elements: ['body', '#root', '.appFrame', '.app', '.maka-panel-detail', '.mainColumn', '.maka-onboarding-loading'].map((selector) => {
+        elements: ['body', '#root', '.appFrame', '.app', '.maka-panel-detail', '.mainColumn', '.maka-preload'].map((selector) => {
           const element = document.querySelector(selector);
           if (!element) return { selector, present: false };
           const rect = element.getBoundingClientRect();

@@ -21,6 +21,7 @@ import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import type { SessionEvent, ShellRunUpdate } from '@maka/core/events';
 import { projectToolArgsPreview } from '@maka/core/tool-quiet-preview';
+import { resolveReadInput } from '@maka/runtime/read-page';
 import {
   decodeRuntimeResourceRef,
   encodeProtocolMessage,
@@ -42,6 +43,7 @@ import {
   type SessionDomainChangedFrame,
   type SessionEventFrame,
   type SessionRuntimeResourcePtyDataFrame,
+  type OrderedSubscriptionFrame,
   type SessionSteeringEvent,
   type SessionToolEvent,
   type SessionTranscriptAdvancedFrame,
@@ -54,7 +56,11 @@ import {
   type TurnProviderRetry,
   type TurnSnapshot,
 } from '../protocol/index.js';
-import type { SessionContinuityOperationHandlerMap } from './operation-dispatcher.js';
+import type {
+  ConnectionContext,
+  SessionContinuityOperationHandlerMap,
+} from './operation-dispatcher.js';
+import type { RuntimeHostAccessAuthority } from './access-authority.js';
 import { type SessionAdmissionLease, SessionAdmissionGate } from './session-admission-gate.js';
 import {
   type CanonicalSessionProjection,
@@ -67,20 +73,18 @@ import type {
 } from './session-continuity-service.js';
 import {
   createSessionTranscriptBootstrap,
-  prepareSessionTranscriptOverlay,
   readSessionTranscriptPage,
   type SubscriberTranscriptState,
   TranscriptPageRequestError,
   updateSubscriberTranscriptHighWater,
 } from './session-transcript-pager.js';
-import {
-  ACTIVE_TRANSCRIPT_OVERLAY_MAX_BYTES,
-  type SessionTranscriptReader,
-} from './session-transcript-reader.js';
+import type { SessionTranscriptReader } from './session-transcript-reader.js';
+import { projectSharedSessionMessageContent } from './shared-session-transcript.js';
 
 const MAX_CONNECTION_SUBSCRIPTIONS = 16;
 const MAX_SUBSCRIBER_QUEUED_FRAMES = 32;
 const MAX_SUBSCRIBER_QUEUED_BYTES = 256 * 1024;
+const ASSISTANT_BACKLOG_CHUNK_CHARACTERS = 8 * 1024;
 
 export type { CanonicalSessionProjection } from './canonical-session-projection.js';
 
@@ -111,7 +115,6 @@ interface SessionProjectionState {
   revision: number;
   subscribers: Map<string, Subscriber>;
   assistantStreams: Map<string, ActiveAssistantStream>;
-  transcriptOverlay?: CachedTranscriptOverlay;
   /**
    * Latest live tool_result_preview per toolUseId for the active turn.
    * Replace semantics; cleared on tool_result and terminal publication.
@@ -141,17 +144,17 @@ interface ConnectionState {
   sink: SessionContinuityFrameSink;
   subscriptionIds: Set<string>;
   pendingOpenCount: number;
-  readonly closed: Promise<void>;
-  resolveClosed(): void;
 }
 
 interface QueuedSubscriptionFrame {
-  frame: SubscriptionFrame;
+  frame: OrderedSubscriptionFrame;
   encodedBytes: number;
 }
 
 interface Subscriber {
   connectionId: string;
+  principalId: string;
+  principalKind: NonNullable<ConnectionContext['principalKind']>;
   sessionId: string;
   subscriptionId: string;
   sink: SessionContinuityFrameSink;
@@ -162,49 +165,31 @@ interface Subscriber {
   queue: QueuedSubscriptionFrame[];
   queuedBytes: number;
   pumping: boolean;
+  ptyQueue: { frame: SessionRuntimeResourcePtyDataFrame; encodedBytes: number }[];
+  ptyQueuedBytes: number;
+  ptyPumping: boolean;
+  ptyInterests: Set<string>;
   terminalQueued: boolean;
   transcript?: SubscriberTranscriptState;
-  retainedTranscriptOverlay?: RetainedTranscriptOverlay;
+  /**
+   * Streams that were already running when this subscriber opened. Their text
+   * is paid out as the queue drains, so a long stream cannot overflow the queue.
+   */
+  assistantBacklog: Map<string, AssistantBacklog>;
+  /**
+   * Work that arrived while a backlog was still unpaid. A subscriber has one
+   * delivery order, so anything produced after the text it is catching up on
+   * waits here instead of overtaking it. It spends the queue's byte budget.
+   */
+  deferred: Array<{ work: () => void; bytes: number }>;
+  deferredBytes: number;
 }
 
-interface RetainedTranscriptOverlay {
-  readonly messages: readonly Buffer[];
-  readonly bytes: number;
-  references: number;
-}
-
-interface CachedTranscriptOverlay {
-  readonly throughSequence: number | null;
-  readonly prepared: Promise<RetainedTranscriptOverlay>;
-  pendingConsumers: number;
-  cancelPreparation(): void;
-}
-
-interface TranscriptOverlayPreparationWaiter {
-  cancelled: boolean;
-  granted: boolean;
-  resolve(release: () => void): void;
-  reject(error: Error): void;
-}
-
-interface TranscriptOverlayPreparationPermit {
-  readonly waiter: TranscriptOverlayPreparationWaiter;
-  take(): () => void;
-  release(): void;
-}
-
-const MAX_RETAINED_TRANSCRIPT_OVERLAY_BYTES = 64 * 1024 * 1024;
-const MAX_TRANSCRIPT_OVERLAY_PREPARATION_WAITERS = 64;
-// Preparation can retain the active projection, durable reconciliation, and
-// final encoded snapshot at the same time; charge all three to the Host budget.
-const MAX_TRANSCRIPT_OVERLAY_PREPARATION_BYTES = ACTIVE_TRANSCRIPT_OVERLAY_MAX_BYTES * 3;
-
-class TranscriptOverlayCapacityError extends Error {
-  readonly name = 'TranscriptOverlayCapacityError';
-}
-
-class TranscriptOverlayPreparationRequired extends Error {
-  readonly name = 'TranscriptOverlayPreparationRequired';
+interface AssistantBacklog {
+  /** Characters of the stream this subscriber has been sent. */
+  sent: number;
+  /** Set when the stream completed before the subscriber caught up. */
+  completion?: { runId: string; stream: ActiveAssistantStream; interrupted?: true };
 }
 
 interface PendingRefresh {
@@ -229,8 +214,29 @@ interface PendingSessionDomainChanges {
 
 export class SessionContinuityCoordinator implements SessionContinuityService {
   readonly handlers: SessionContinuityOperationHandlerMap = {
+    'subscription.pty_interest.set': async (input, context) => {
+      const subscriber = this.#ownedSubscriber(context.connectionId, input.subscriptionId);
+      if (!subscriber || !this.#canObserve(subscriber, subscriber.sessionId)) {
+        return {
+          ok: false,
+          error: { code: 'not_found', message: 'Session subscription was not found' },
+        };
+      }
+      subscriber.ptyInterests = new Set(input.refs);
+      // An already writing frame may finish. Everything else belongs to the
+      // current visible set; reacquiring uses a fresh terminal snapshot.
+      subscriber.ptyQueue = subscriber.ptyQueue.filter(
+        (entry, index) =>
+          (index === 0 && subscriber.ptyPumping) || subscriber.ptyInterests.has(entry.frame.ref),
+      );
+      subscriber.ptyQueuedBytes = subscriber.ptyQueue.reduce(
+        (bytes, entry) => bytes + entry.encodedBytes,
+        0,
+      );
+      return { ok: true, result: { subscriptionId: input.subscriptionId } };
+    },
     'subscription.open': async (input, context) => {
-      const result = await this.#open(context.connectionId, input);
+      const result = await this.#open(context, input);
       return result.ok
         ? { ok: true, result: result.value }
         : { ok: false, error: { code: result.code, message: result.message } };
@@ -244,23 +250,18 @@ export class SessionContinuityCoordinator implements SessionContinuityService {
             error: { code: 'not_found', message: 'Session subscription was not found' },
           };
     },
-    'session.transcript.page': (input, context) =>
-      this.#readTranscriptPage(context.connectionId, input),
-    'session.transcript.overlay.release': async (input, context) => {
-      const existing = this.#subscriptions.get(input.subscriptionId);
-      if (!existing) {
-        return { ok: true, result: { subscriptionId: input.subscriptionId } };
-      }
-      const subscriber = this.#ownedSubscriber(context.connectionId, input.subscriptionId);
-      if (!subscriber) {
+    'subscription.ready': async (input, context) => {
+      if (!this.#ownedSubscriber(context.connectionId, input.subscriptionId)) {
         return {
           ok: false,
           error: { code: 'not_found', message: 'Session subscription was not found' },
         };
       }
-      this.#releaseSubscriberTranscriptOverlay(subscriber);
+      this.#activate(context.connectionId, input.subscriptionId);
       return { ok: true, result: { subscriptionId: input.subscriptionId } };
     },
+    'session.transcript.page': (input, context) =>
+      this.#readTranscriptPage(context.connectionId, input),
   };
 
   readonly #connections = new Map<string, ConnectionState>();
@@ -269,14 +270,15 @@ export class SessionContinuityCoordinator implements SessionContinuityService {
   readonly #pendingRefreshes = new Map<string, PendingRefresh>();
   readonly #pendingAgentGraphChanges = new Map<string, PendingAgentGraphChange>();
   readonly #pendingSessionDomainChanges = new Map<string, PendingSessionDomainChanges>();
-  readonly #retainedTranscriptOverlays = new Map<readonly Buffer[], RetainedTranscriptOverlay>();
-  readonly #transcriptOverlayPreparationWaiters: TranscriptOverlayPreparationWaiter[] = [];
+  readonly #pendingTranscriptAdvances = new Map<string, PendingRefresh>();
   readonly #hostEpoch: string;
   readonly #readCanonical: ReadCanonicalSessionProjection;
   readonly #transcriptReader: SessionTranscriptReader | undefined;
   #closed = false;
-  #preparingTranscriptOverlayBytes = 0;
-  #retainedTranscriptOverlayBytes = 0;
+  readonly #sessionAccessAuthority:
+    | Pick<RuntimeHostAccessAuthority, 'activeSessionGrant' | 'subscribeGrantRevocations'>
+    | undefined;
+  readonly #unsubscribeGrantRevocations: (() => void) | undefined;
 
   constructor(
     hostEpoch: string,
@@ -285,10 +287,28 @@ export class SessionContinuityCoordinator implements SessionContinuityService {
     private readonly onPublicationFailure: (error: unknown) => void = () => undefined,
     transcriptReader?: SessionTranscriptReader,
     private readonly onCatalogChanged: (sessionId: string) => void = () => undefined,
+    sessionAccessAuthority?: Pick<
+      RuntimeHostAccessAuthority,
+      'activeSessionGrant' | 'subscribeGrantRevocations'
+    >,
   ) {
     this.#hostEpoch = hostEpoch;
     this.#readCanonical = readCanonical;
     this.#transcriptReader = transcriptReader;
+    this.#sessionAccessAuthority = sessionAccessAuthority;
+    this.#unsubscribeGrantRevocations = sessionAccessAuthority?.subscribeGrantRevocations(
+      (grant) => {
+        if (grant.kind !== 'session_observation') return;
+        for (const subscriber of this.#subscriptions.values()) {
+          if (
+            subscriber.principalId === grant.principalId &&
+            subscriber.sessionId === grant.sessionId
+          ) {
+            this.#closeSubscriber(subscriber, 'access_revoked');
+          }
+        }
+      },
+    );
   }
 
   attachConnection(
@@ -299,19 +319,13 @@ export class SessionContinuityCoordinator implements SessionContinuityService {
     if (this.#connections.has(connectionId)) {
       throw new Error(`Duplicate Runtime Host connection: ${connectionId}`);
     }
-    const closed = signal();
     this.#connections.set(connectionId, {
       sink,
       subscriptionIds: new Set(),
       pendingOpenCount: 0,
-      closed: closed.promise,
-      resolveClosed: closed.resolve,
     });
     let attached = true;
     return {
-      activate: (subscriptionId) => {
-        if (attached) this.#activate(connectionId, subscriptionId);
-      },
       abort: (subscriptionId) => {
         if (attached) this.#abortSubscription(connectionId, subscriptionId);
       },
@@ -331,7 +345,6 @@ export class SessionContinuityCoordinator implements SessionContinuityService {
         if (this.#closed) return;
         const state = this.#sessions.get(sessionId);
         if (!state || (state.subscribers.size === 0 && !state.terminalPublicationFence)) return;
-        this.#invalidateTranscriptOverlay(state);
         const canonical = await this.#readCanonicalProjection(sessionId);
         if (this.#closed || !canonical) return;
         await this.#refreshTranscriptHighWater(sessionId, state);
@@ -372,6 +385,44 @@ export class SessionContinuityCoordinator implements SessionContinuityService {
       );
   }
 
+  /** Safe for synchronous commit hooks: publishes the transcript high water after RuntimeEvents commit. */
+  enqueueTranscriptAdvanced(sessionId: string): void {
+    if (this.#closed || !this.#sessions.has(sessionId)) return;
+    const pending = this.#pendingTranscriptAdvances.get(sessionId);
+    if (pending) {
+      if (pending.inFlight) pending.dirty = true;
+      return;
+    }
+    const advance: PendingRefresh = { dirty: false, inFlight: false };
+    this.#pendingTranscriptAdvances.set(sessionId, advance);
+    const run = async () => {
+      if (this.#closed) return;
+      const state = this.#sessions.get(sessionId);
+      // A fenced terminal publication advances the transcript together with
+      // the terminal projection, so a turn_state row never outruns its Turn.
+      if (!state || state.terminalPublicationFence) return;
+      await this.#refreshTranscriptHighWater(sessionId, state);
+    };
+    void this.sessionAdmission
+      .enqueueDetached(sessionId, async () => {
+        advance.inFlight = true;
+        await run();
+        if (!advance.dirty) return;
+        advance.dirty = false;
+        await run();
+      })
+      .then(
+        () => {
+          this.#pendingTranscriptAdvances.delete(sessionId);
+          if (advance.dirty) this.enqueueTranscriptAdvanced(sessionId);
+        },
+        (error) => {
+          this.#pendingTranscriptAdvances.delete(sessionId);
+          this.onPublicationFailure(error);
+        },
+      );
+  }
+
   /** Coalesce process-local graph invalidations onto the root Session sequence. */
   enqueueAgentGraphChanged(event: {
     rootSessionId: string;
@@ -394,6 +445,7 @@ export class SessionContinuityCoordinator implements SessionContinuityService {
         const state = this.#sessions.get(event.rootSessionId);
         if (!state) return;
         for (const subscriber of state.subscribers.values()) {
+          if (subscriber.principalKind === 'session_guest') continue;
           const frame: AgentGraphChangedFrame = {
             kind: 'subscription.agent_graph_changed',
             hostEpoch: this.#hostEpoch,
@@ -448,42 +500,40 @@ export class SessionContinuityCoordinator implements SessionContinuityService {
     }
   }
 
-  /** Publish live PTY bytes on the same ordered Session subscription as its durable projection. */
+  /** PTY congestion never consumes Session sequence numbers or its queue budget. */
   async enqueueRuntimeResourcePtyData(event: {
     sessionId: string;
     ref: string;
     sequence: number;
     data: string;
   }): Promise<void> {
-    if (
-      this.#closed ||
-      Buffer.byteLength(event.data, 'utf8') > SESSION_RUNTIME_RESOURCE_PTY_DATA_MAX_BYTES
-    ) {
-      return;
-    }
+    if (this.#closed) return;
     try {
-      await this.sessionAdmission.enqueueDetached(event.sessionId, () => {
-        if (this.#closed) return;
-        const state = this.#sessions.get(event.sessionId);
-        if (!state) return;
-        for (const subscriber of state.subscribers.values()) {
-          const frame: SessionRuntimeResourcePtyDataFrame = {
-            kind: 'subscription.runtime_resource_pty_data',
-            hostEpoch: this.#hostEpoch,
-            subscriptionId: subscriber.subscriptionId,
-            sequence: subscriber.nextSequence,
-            sessionId: event.sessionId,
-            ref: event.ref,
-            ptySequence: event.sequence,
-            data: event.data,
-          };
-          if (
-            Buffer.byteLength(JSON.stringify(frame), 'utf8') <= SESSION_SUBSCRIPTION_FRAME_MAX_BYTES
-          ) {
-            this.#enqueue(subscriber, frame);
-          }
+      const state = this.#sessions.get(event.sessionId);
+      if (!state) return;
+      for (const subscriber of state.subscribers.values()) {
+        if (!this.#canObserve(subscriber, event.sessionId)) {
+          this.#closeSubscriber(subscriber, 'access_revoked');
+          continue;
         }
-      });
+        if (!subscriber.ptyInterests.has(event.ref)) continue;
+        const frame: SessionRuntimeResourcePtyDataFrame = {
+          kind: 'subscription.runtime_resource_pty_data',
+          hostEpoch: this.#hostEpoch,
+          subscriptionId: subscriber.subscriptionId,
+          sessionId: event.sessionId,
+          ref: event.ref,
+          ptySequence: event.sequence,
+          ...(Buffer.byteLength(event.data, 'utf8') > SESSION_RUNTIME_RESOURCE_PTY_DATA_MAX_BYTES
+            ? { data: '', reset: true as const }
+            : { data: event.data }),
+        };
+        if (
+          Buffer.byteLength(JSON.stringify(frame), 'utf8') <= SESSION_SUBSCRIPTION_FRAME_MAX_BYTES
+        ) {
+          this.#enqueuePty(subscriber, frame);
+        }
+      }
     } catch (error) {
       this.onPublicationFailure(error);
     }
@@ -518,12 +568,24 @@ export class SessionContinuityCoordinator implements SessionContinuityService {
         }
         for (const change of frames) {
           for (const subscriber of state.subscribers.values()) {
+            const projected =
+              change.domain === 'runtime_resource' && subscriber.principalKind === 'session_guest'
+                ? {
+                    ...change,
+                    resources: change.resources.filter(
+                      (resource) => resource.sourceSessionId === subscriber.sessionId,
+                    ),
+                  }
+                : change;
+            if (projected.domain === 'runtime_resource' && projected.resources.length === 0) {
+              continue;
+            }
             const frame: SessionDomainChangedFrame = {
               kind: 'subscription.session_domain_changed',
               hostEpoch: this.#hostEpoch,
               subscriptionId: subscriber.subscriptionId,
               sequence: subscriber.nextSequence,
-              ...change,
+              ...projected,
             };
             this.#enqueue(subscriber, frame);
           }
@@ -603,17 +665,32 @@ export class SessionContinuityCoordinator implements SessionContinuityService {
 
         const nextRevision = state.revision + 1;
         const snapshot = createSessionContinuitySnapshot(canonical, nextRevision);
-        this.#invalidateTranscriptOverlay(state);
+        this.#invalidateSettledChoiceTranscript(state, canonical);
         state.canonical = canonical;
         state.revision = nextRevision;
         delete state.terminalPublicationFence;
+        // A subscriber still being paid a stream's prefix has not seen the end
+        // of it. The Turn ending does not make that text untrue, so each
+        // backlog keeps its own copy of the stream and finishes paying it; the
+        // terminal projection queues behind that, never over it.
+        for (const subscriber of state.subscribers.values()) {
+          for (const [key, backlog] of subscriber.assistantBacklog) {
+            if (backlog.completion) continue;
+            const stream = state.assistantStreams.get(key);
+            if (!stream) {
+              subscriber.assistantBacklog.delete(key);
+              continue;
+            }
+            backlog.completion = { runId: rootTurn.runId, stream: { ...stream } };
+          }
+        }
         state.assistantStreams.clear();
         state.toolResultPreviews.clear();
         this.#broadcastProjection(state, snapshot);
-        if (state.subscribers.size === 0) {
-          this.#invalidateTranscriptOverlay(state);
-          this.#sessions.delete(sessionId);
+        for (const subscriber of state.subscribers.values()) {
+          this.#payAssistantBacklog(subscriber, state);
         }
+        if (state.subscribers.size === 0) this.#sessions.delete(sessionId);
       },
       admission,
     );
@@ -644,7 +721,6 @@ export class SessionContinuityCoordinator implements SessionContinuityService {
         if (!canonical) throw new Error('Runtime event belongs to a missing Session');
         state = this.#commitCanonical(sessionId, canonical).state;
       }
-      this.#invalidateTranscriptOverlay(state);
       const rootTurn = state.canonical.rootTurn;
       if (
         !rootTurn ||
@@ -674,7 +750,18 @@ export class SessionContinuityCoordinator implements SessionContinuityService {
           text: (current?.text ?? '') + event.text,
         });
         for (const subscriber of state.subscribers.values()) {
-          this.#enqueueAssistantDelta(subscriber, sessionId, runId, event, kind, startOffset);
+          if (subscriber.assistantBacklog.has(prefixKey)) {
+            // This text is part of the prefix still being paid out; the payout
+            // reads the accumulated stream, so it carries this delta already.
+            this.#payAssistantBacklog(subscriber, state);
+          } else {
+            this.#deliverInOrder(
+              subscriber,
+              () =>
+                this.#enqueueAssistantDelta(subscriber, sessionId, runId, event, kind, startOffset),
+              () => Buffer.byteLength(event.text, 'utf8'),
+            );
+          }
         }
         return;
       }
@@ -697,12 +784,12 @@ export class SessionContinuityCoordinator implements SessionContinuityService {
         if (thinking) {
           const finalThinking = thinking.completedParts?.join('') ?? thinking.text;
           for (const subscriber of state.subscribers.values()) {
-            this.#enqueueAssistantCompletion(
+            this.#completeAssistantStream(
               subscriber,
-              sessionId,
+              state,
               runId,
+              thinkingKey,
               thinking,
-              'thinking',
               finalThinking,
             );
           }
@@ -711,7 +798,7 @@ export class SessionContinuityCoordinator implements SessionContinuityService {
 
         const textKey = assistantStreamKey('text', event.messageId);
         const text = state.assistantStreams.get(textKey);
-        if (text || event.text.length > 0) {
+        if (text || event.text.length > 0 || event.interrupted) {
           const current =
             text ??
             ({
@@ -721,13 +808,14 @@ export class SessionContinuityCoordinator implements SessionContinuityService {
               text: '',
             } satisfies ActiveAssistantStream);
           for (const subscriber of state.subscribers.values()) {
-            this.#enqueueAssistantCompletion(
+            this.#completeAssistantStream(
               subscriber,
-              sessionId,
+              state,
               runId,
+              textKey,
               current,
-              'text',
               event.text,
+              event.interrupted,
             );
           }
           state.assistantStreams.delete(textKey);
@@ -739,18 +827,27 @@ export class SessionContinuityCoordinator implements SessionContinuityService {
       } else if (event.type === 'tool_result') {
         state.toolResultPreviews.delete(event.toolUseId);
       }
-      const projected = projectSessionEvent(event);
       for (const subscriber of state.subscribers.values()) {
-        const frame: SessionEventFrame = {
-          kind: 'subscription.session_event',
-          hostEpoch: this.#hostEpoch,
-          subscriptionId: subscriber.subscriptionId,
-          sequence: subscriber.nextSequence,
-          sessionId,
-          runId,
-          event: projected,
-        };
-        this.#enqueue(subscriber, frame);
+        this.#deliverInOrder(
+          subscriber,
+          () => {
+            const frame: SessionEventFrame = {
+              kind: 'subscription.session_event',
+              hostEpoch: this.#hostEpoch,
+              subscriptionId: subscriber.subscriptionId,
+              sequence: subscriber.nextSequence,
+              sessionId,
+              runId,
+              event: projectSessionEvent(
+                event,
+                sessionId,
+                subscriber.principalKind === 'session_guest',
+              ),
+            };
+            this.#enqueue(subscriber, frame);
+          },
+          () => Buffer.byteLength(JSON.stringify(event), 'utf8'),
+        );
       }
     });
   }
@@ -768,7 +865,6 @@ export class SessionContinuityCoordinator implements SessionContinuityService {
           for (const subscriber of state.subscribers.values()) {
             this.#enqueueSessionRemoved(subscriber);
           }
-          this.#invalidateTranscriptOverlay(state);
           this.#sessions.delete(sessionId);
         },
         admission,
@@ -779,30 +875,40 @@ export class SessionContinuityCoordinator implements SessionContinuityService {
   close(): void {
     if (this.#closed) return;
     this.#closed = true;
-    this.#cancelTranscriptOverlayPreparationWaiters();
+    this.#unsubscribeGrantRevocations?.();
     for (const connectionId of [...this.#connections.keys()]) this.#closeConnection(connectionId);
-    for (const state of this.#sessions.values()) this.#invalidateTranscriptOverlay(state);
     this.#sessions.clear();
     this.#subscriptions.clear();
     this.#pendingRefreshes.clear();
+    this.#pendingTranscriptAdvances.clear();
     this.#pendingAgentGraphChanges.clear();
     this.#pendingSessionDomainChanges.clear();
   }
 
   async #open(
-    connectionId: string,
+    context: ConnectionContext,
     input: SubscriptionOpenInput,
   ): Promise<
     | { ok: true; value: SubscriptionOpenResult }
     | {
         ok: false;
-        code: 'not_found' | 'operation_conflict' | 'operation_unavailable' | 'persistence_failed';
+        code:
+          | 'not_found'
+          | 'operation_conflict'
+          | 'operation_unavailable'
+          | 'persistence_failed'
+          | 'transcript_preparing';
         message: string;
       }
   > {
+    const connectionId = context.connectionId;
+    const identity = connectionIdentity(context);
     const sessionId = input.sessionId;
     const connection = this.#connections.get(connectionId);
     if (!connection) throw new Error('Runtime Host connection is not attached to continuity');
+    if (!this.#canObserve(identity, sessionId)) {
+      return { ok: false, code: 'not_found', message: 'Session was not found' };
+    }
     if (
       connection.subscriptionIds.size + connection.pendingOpenCount >=
       MAX_CONNECTION_SUBSCRIPTIONS
@@ -814,202 +920,68 @@ export class SessionContinuityCoordinator implements SessionContinuityService {
       };
     }
     connection.pendingOpenCount += 1;
-    let preparationPermit: TranscriptOverlayPreparationPermit | undefined;
-    let retryAfterCapacity = false;
     try {
-      for (;;) {
-        try {
-          return await this.sessionAdmission.run(sessionId, async () => {
-            if (this.#connections.get(connectionId) !== connection) {
-              throw new Error('Runtime Host connection closed during subscription open');
-            }
-            const canonical = await this.#readCanonicalProjection(sessionId);
-            if (this.#connections.get(connectionId) !== connection) {
-              throw new Error('Runtime Host connection closed during subscription open');
-            }
-            if (!canonical) {
-              return {
-                ok: false as const,
-                code: 'not_found' as const,
-                message: 'Session was not found',
-              };
-            }
-            const committed = this.#commitCanonical(sessionId, canonical);
-            if (committed.changed) {
-              this.#invalidateTranscriptOverlay(committed.state);
-              this.#broadcastProjection(committed.state, committed.value);
-            }
-            if (this.#connections.get(connectionId) !== connection) {
-              this.#scheduleInactiveStateCleanup(sessionId, committed.state);
-              throw new Error('Runtime Host connection closed during subscription open');
-            }
+      return await this.sessionAdmission.run(sessionId, async () => {
+        if (this.#connections.get(connectionId) !== connection) {
+          throw new Error('Runtime Host connection closed during subscription open');
+        }
+        const canonical = await this.#readCanonicalProjection(sessionId);
+        if (this.#connections.get(connectionId) !== connection) {
+          throw new Error('Runtime Host connection closed during subscription open');
+        }
+        if (!canonical) {
+          return {
+            ok: false as const,
+            code: 'not_found' as const,
+            message: 'Session was not found',
+          };
+        }
+        const committed = this.#commitCanonical(sessionId, canonical);
+        if (committed.changed) this.#broadcastProjection(committed.state, committed.value);
+        if (this.#connections.get(connectionId) !== connection) {
+          this.#scheduleInactiveStateCleanup(sessionId, committed.state);
+          throw new Error('Runtime Host connection closed during subscription open');
+        }
 
-            const subscriptionId = randomUUID();
-            const activeAssistantStreams = [...committed.state.assistantStreams.values()].map(
-              ({ kind, turnId, messageId }) => ({ kind, turnId, messageId }),
-            );
-            let transcript: SubscriberTranscriptState | undefined;
-            let retainedTranscriptOverlay: RetainedTranscriptOverlay | undefined;
-            let cachedTranscriptOverlay: CachedTranscriptOverlay | undefined;
-            let transcriptSubscriberInstalled = false;
-            let transcriptBootstrap: SubscriptionOpenResult['transcript'] = null;
-            try {
-              if (input.transcript.kind === 'tail') {
-                if (!this.#transcriptReader) {
-                  return {
-                    ok: false as const,
-                    code: 'operation_unavailable' as const,
-                    message: 'Session transcript is unavailable',
-                  };
-                }
-                try {
-                  const throughSequence =
-                    await this.#transcriptReader.readDurableHighWater(sessionId);
-                  cachedTranscriptOverlay = this.#prepareTranscriptOverlay(
-                    committed.state,
-                    sessionId,
-                    throughSequence,
-                    preparationPermit,
-                  );
-                  cachedTranscriptOverlay.pendingConsumers += 1;
-                  retainedTranscriptOverlay = await Promise.race([
-                    cachedTranscriptOverlay.prepared,
-                    connection.closed.then(() => {
-                      throw new Error('Runtime Host connection closed during subscription open');
-                    }),
-                  ]);
-                  const created = await createSessionTranscriptBootstrap({
-                    reader: this.#transcriptReader,
-                    sessionId,
-                    subscriptionId,
-                    throughSequence,
-                    rootTurn: committed.state.canonical.rootTurn,
-                    activeAssistantStreams: committed.state.assistantStreams.values(),
-                    maxBytes: input.transcript.maxBytes,
-                    preparedOverlayMessages: retainedTranscriptOverlay.messages,
-                    maxEncodedBytes: subscriptionOpenTranscriptBudget({
-                      hostEpoch: this.#hostEpoch,
-                      subscriptionId,
-                      nextSequence: 1,
-                      snapshot: committed.value,
-                      activeAssistantStreams,
-                      transcript: null,
-                    }),
-                  });
-                  transcript = created.state;
-                  transcriptBootstrap = created.bootstrap;
-                } catch (error) {
-                  if (error instanceof TranscriptOverlayPreparationRequired) throw error;
-                  return {
-                    ok: false as const,
-                    code:
-                      error instanceof TranscriptOverlayCapacityError
-                        ? ('operation_unavailable' as const)
-                        : ('persistence_failed' as const),
-                    message:
-                      error instanceof TranscriptOverlayCapacityError
-                        ? 'Runtime Host transcript overlay capacity reached'
-                        : 'Session transcript is unavailable',
-                  };
-                }
-              }
-              if (this.#connections.get(connectionId) !== connection) {
-                this.#scheduleInactiveStateCleanup(sessionId, committed.state);
-                throw new Error('Runtime Host connection closed during subscription open');
-              }
-              const openValue: SubscriptionOpenResult = {
-                hostEpoch: this.#hostEpoch,
-                subscriptionId,
-                nextSequence: 1,
-                snapshot: committed.value,
-                activeAssistantStreams,
-                transcript: transcriptBootstrap,
-              };
-              if (
-                Buffer.byteLength(JSON.stringify(openValue), 'utf8') >
-                SUBSCRIPTION_OPEN_RESULT_MAX_BYTES
-              ) {
-                return {
-                  ok: false as const,
-                  code: 'operation_unavailable' as const,
-                  message: 'Session subscription state exceeds the transport limit',
-                };
-              }
-              const subscriber: Subscriber = {
-                connectionId,
-                sessionId,
-                subscriptionId,
-                sink: connection.sink,
-                phase: 'open',
-                activated: false,
-                nextSequence: 1,
-                lastFlushedSequence: 0,
-                queue: [],
-                queuedBytes: 0,
-                pumping: false,
-                terminalQueued: false,
-                ...(transcript ? { transcript } : {}),
-                ...(retainedTranscriptOverlay ? { retainedTranscriptOverlay } : {}),
-              };
-              if (subscriber.retainedTranscriptOverlay)
-                this.#retainTranscriptOverlay(subscriber.retainedTranscriptOverlay);
-              committed.state.subscribers.set(subscriptionId, subscriber);
-              this.#subscriptions.set(subscriptionId, subscriber);
-              connection.subscriptionIds.add(subscriptionId);
-              transcriptSubscriberInstalled = subscriber.retainedTranscriptOverlay !== undefined;
-              // Client expects the first delivered frame at nextSequence from the open
-              // result. Capture that before enqueueing retained previews — each
-              // #enqueue advances nextSequence.
-              const firstSequence = subscriber.nextSequence;
-              // Seed retained live previews so a mid-turn rejoin still has Open facts.
-              const rootTurn = committed.state.canonical.rootTurn;
-              if (rootTurn && !isTerminalTurn(rootTurn)) {
-                for (const preview of committed.state.toolResultPreviews.values()) {
-                  if (preview.turnId !== rootTurn.turnId) continue;
-                  const frame: SessionEventFrame = {
-                    kind: 'subscription.session_event',
-                    hostEpoch: this.#hostEpoch,
-                    subscriptionId: subscriber.subscriptionId,
-                    sequence: subscriber.nextSequence,
-                    sessionId,
-                    runId: rootTurn.runId,
-                    event: projectSessionEvent(preview),
-                  };
-                  this.#enqueue(subscriber, frame);
-                }
-              }
-              return {
-                ok: true as const,
-                value: { ...openValue, nextSequence: firstSequence },
-              };
-            } finally {
-              if (cachedTranscriptOverlay) cachedTranscriptOverlay.pendingConsumers -= 1;
-              if (
-                cachedTranscriptOverlay &&
-                !transcriptSubscriberInstalled &&
-                cachedTranscriptOverlay.pendingConsumers === 0 &&
-                !this.#hasTranscriptOverlayConsumer(committed.state)
-              ) {
-                this.#invalidateTranscriptOverlay(committed.state, cachedTranscriptOverlay);
-              }
-            }
-          });
-        } catch (error) {
-          if (!(error instanceof TranscriptOverlayPreparationRequired)) throw error;
-          if (retryAfterCapacity) {
+        const subscriptionId = randomUUID();
+        const activeAssistantStreams = [...committed.state.assistantStreams.values()].map(
+          ({ kind, turnId, messageId }) => ({ kind, turnId, messageId }),
+        );
+        let transcript: SubscriberTranscriptState | undefined;
+        let transcriptBootstrap: SubscriptionOpenResult['transcript'] = null;
+        if (input.transcript.kind === 'tail') {
+          if (!this.#transcriptReader) {
             return {
               ok: false as const,
               code: 'operation_unavailable' as const,
-              message: 'Runtime Host transcript overlay capacity reached',
+              message: 'Session transcript is unavailable',
             };
           }
           try {
-            preparationPermit = await this.#acquireTranscriptOverlayPreparation(connection);
-          } catch (acquireError) {
-            if (acquireError instanceof TranscriptOverlayCapacityError) {
-              retryAfterCapacity = true;
-              continue;
-            }
+            const throughSequence = await this.#transcriptReader.readDurableHighWater(sessionId);
+            const snapshot = projectSessionSnapshot(committed.value, identity.principalKind);
+            const created = await createSessionTranscriptBootstrap({
+              reader: this.#transcriptReader,
+              sessionId,
+              subscriptionId,
+              throughSequence,
+              maxBytes: input.transcript.maxBytes,
+              projection: identity.principalKind === 'session_guest' ? 'shared' : 'owner',
+              maxEncodedBytes: subscriptionOpenTranscriptBudget({
+                hostEpoch: this.#hostEpoch,
+                subscriptionId,
+                nextSequence: 1,
+                snapshot,
+                activeAssistantStreams,
+                transcript: null,
+              }),
+            });
+            transcript = created.state;
+            transcriptBootstrap = created.bootstrap;
+          } catch (error) {
+            // The client can only retry, but a projection that outgrew its
+            // bounds is a Host defect and has to leave a trace here.
+            this.onPublicationFailure(error);
             return {
               ok: false as const,
               code: 'persistence_failed' as const,
@@ -1017,9 +989,95 @@ export class SessionContinuityCoordinator implements SessionContinuityService {
             };
           }
         }
-      }
+        if (this.#connections.get(connectionId) !== connection) {
+          this.#scheduleInactiveStateCleanup(sessionId, committed.state);
+          throw new Error('Runtime Host connection closed during subscription open');
+        }
+        const openValue: SubscriptionOpenResult = {
+          hostEpoch: this.#hostEpoch,
+          subscriptionId,
+          nextSequence: 1,
+          snapshot: projectSessionSnapshot(committed.value, identity.principalKind),
+          activeAssistantStreams,
+          transcript: transcriptBootstrap,
+        };
+        if (
+          Buffer.byteLength(JSON.stringify(openValue), 'utf8') > SUBSCRIPTION_OPEN_RESULT_MAX_BYTES
+        ) {
+          return {
+            ok: false as const,
+            code: 'operation_unavailable' as const,
+            message: 'Session subscription state exceeds the transport limit',
+          };
+        }
+        if (!this.#canObserve(identity, sessionId)) {
+          return {
+            ok: false as const,
+            code: 'not_found' as const,
+            message: 'Session was not found',
+          };
+        }
+        const subscriber: Subscriber = {
+          connectionId,
+          principalId: identity.principalId,
+          principalKind: identity.principalKind,
+          sessionId,
+          subscriptionId,
+          sink: connection.sink,
+          phase: 'open',
+          activated: false,
+          nextSequence: 1,
+          lastFlushedSequence: 0,
+          queue: [],
+          ptyQueue: [],
+          ptyInterests: new Set(),
+          ptyQueuedBytes: 0,
+          ptyPumping: false,
+          queuedBytes: 0,
+          pumping: false,
+          terminalQueued: false,
+          assistantBacklog: new Map(
+            [...committed.state.assistantStreams.keys()].map((key) => [key, { sent: 0 }]),
+          ),
+          deferred: [],
+          deferredBytes: 0,
+          ...(transcript ? { transcript } : {}),
+        };
+        committed.state.subscribers.set(subscriptionId, subscriber);
+        this.#subscriptions.set(subscriptionId, subscriber);
+        connection.subscriptionIds.add(subscriptionId);
+        // Client expects the first delivered frame at nextSequence from the open
+        // result. Capture that before enqueueing retained previews — each
+        // #enqueue advances nextSequence.
+        const firstSequence = subscriber.nextSequence;
+        // Seed retained live previews so a mid-turn rejoin still has Open facts.
+        const rootTurn = committed.state.canonical.rootTurn;
+        if (rootTurn && !isTerminalTurn(rootTurn)) {
+          for (const preview of committed.state.toolResultPreviews.values()) {
+            if (preview.turnId !== rootTurn.turnId) continue;
+            const frame: SessionEventFrame = {
+              kind: 'subscription.session_event',
+              hostEpoch: this.#hostEpoch,
+              subscriptionId: subscriber.subscriptionId,
+              sequence: subscriber.nextSequence,
+              sessionId,
+              runId: rootTurn.runId,
+              event: projectSessionEvent(
+                preview,
+                sessionId,
+                subscriber.principalKind === 'session_guest',
+              ),
+            };
+            this.#enqueue(subscriber, frame);
+          }
+        }
+        this.#payAssistantBacklog(subscriber, committed.state);
+        return {
+          ok: true as const,
+          value: { ...openValue, nextSequence: firstSequence },
+        };
+      });
     } finally {
-      preparationPermit?.release();
       connection.pendingOpenCount -= 1;
     }
   }
@@ -1041,9 +1099,18 @@ export class SessionContinuityCoordinator implements SessionContinuityService {
         error: { code: 'operation_unavailable', message: 'Session transcript is unavailable' },
       };
     }
+    const connection = this.#connections.get(connectionId);
+    if (!connection || !this.#canObserve(subscriber, subscriber.sessionId)) {
+      this.#closeSubscriber(subscriber, 'access_revoked');
+      return transcriptSubscriptionNotFound();
+    }
     const transcript = subscriber.transcript;
     return this.sessionAdmission.run(subscriber.sessionId, async () => {
-      if (this.#ownedSubscriber(connectionId, input.subscriptionId) !== subscriber) {
+      if (
+        this.#ownedSubscriber(connectionId, input.subscriptionId) !== subscriber ||
+        this.#connections.get(connectionId) !== connection ||
+        !this.#canObserve(subscriber, subscriber.sessionId)
+      ) {
         return transcriptSubscriptionNotFound();
       }
       try {
@@ -1052,7 +1119,11 @@ export class SessionContinuityCoordinator implements SessionContinuityService {
           state: transcript,
           request: input,
         });
-        if (this.#ownedSubscriber(connectionId, input.subscriptionId) !== subscriber) {
+        if (
+          this.#ownedSubscriber(connectionId, input.subscriptionId) !== subscriber ||
+          this.#connections.get(connectionId) !== connection ||
+          !this.#canObserve(subscriber, subscriber.sessionId)
+        ) {
           return transcriptSubscriptionNotFound();
         }
         return { ok: true, result: page };
@@ -1069,237 +1140,6 @@ export class SessionContinuityCoordinator implements SessionContinuityService {
         };
       }
     });
-  }
-
-  #prepareTranscriptOverlay(
-    state: SessionProjectionState,
-    sessionId: string,
-    throughSequence: number | null,
-    permit: TranscriptOverlayPreparationPermit | undefined,
-  ): CachedTranscriptOverlay {
-    if (!this.#transcriptReader) throw new Error('Session transcript is unavailable');
-    const cached = state.transcriptOverlay;
-    if (cached?.throughSequence === throughSequence) return cached;
-    if (cached) this.#invalidateTranscriptOverlay(state, cached);
-    if (!state.canonical.rootTurn || isTerminalTurn(state.canonical.rootTurn)) {
-      const prepared = Promise.resolve(this.#registerTranscriptOverlay([]));
-      const entry = {
-        throughSequence,
-        prepared,
-        pendingConsumers: 0,
-        cancelPreparation: () => {},
-      };
-      state.transcriptOverlay = entry;
-      return entry;
-    }
-    if (!permit) throw new TranscriptOverlayPreparationRequired();
-    const release = permit.take();
-    const prepared = (async () => {
-      try {
-        if (permit.waiter.cancelled) {
-          throw new Error('Session transcript overlay preparation was cancelled');
-        }
-        const messages = await prepareSessionTranscriptOverlay({
-          reader: this.#transcriptReader!,
-          sessionId,
-          throughSequence,
-          rootTurn: state.canonical.rootTurn,
-          activeAssistantStreams: state.assistantStreams.values(),
-        });
-        return this.#registerTranscriptOverlay(messages);
-      } finally {
-        release();
-      }
-    })();
-    const entry = {
-      throughSequence,
-      prepared,
-      pendingConsumers: 0,
-      cancelPreparation: () => this.#cancelTranscriptOverlayPreparation(permit.waiter),
-    };
-    state.transcriptOverlay = entry;
-    void prepared.catch(() => {
-      if (state.transcriptOverlay === entry) state.transcriptOverlay = undefined;
-    });
-    return entry;
-  }
-
-  async #acquireTranscriptOverlayPreparation(
-    connection: ConnectionState,
-  ): Promise<TranscriptOverlayPreparationPermit> {
-    const ticket = this.#queueTranscriptOverlayPreparation();
-    let release: () => void;
-    try {
-      release = await Promise.race([
-        ticket.ready,
-        connection.closed.then(() => {
-          throw new Error('Runtime Host connection closed during subscription open');
-        }),
-      ]);
-    } catch (error) {
-      this.#cancelTranscriptOverlayPreparation(ticket.waiter);
-      throw error;
-    }
-    let available = true;
-    return {
-      waiter: ticket.waiter,
-      take: () => {
-        if (!available) {
-          throw new Error('Session transcript overlay preparation permit is unavailable');
-        }
-        available = false;
-        return release;
-      },
-      release: () => {
-        if (!available) return;
-        available = false;
-        release();
-      },
-    };
-  }
-
-  #queueTranscriptOverlayPreparation(): {
-    readonly waiter: TranscriptOverlayPreparationWaiter;
-    readonly ready: Promise<() => void>;
-  } {
-    if (
-      this.#transcriptOverlayPreparationWaiters.length >= MAX_TRANSCRIPT_OVERLAY_PREPARATION_WAITERS
-    ) {
-      throw new TranscriptOverlayCapacityError(
-        'Runtime Host transcript overlay preparation queue reached its limit',
-      );
-    }
-    let resolve!: (release: () => void) => void;
-    let reject!: (error: Error) => void;
-    const ready = new Promise<() => void>((resolveReady, rejectReady) => {
-      resolve = resolveReady;
-      reject = rejectReady;
-    });
-    const waiter: TranscriptOverlayPreparationWaiter = {
-      cancelled: false,
-      granted: false,
-      resolve,
-      reject,
-    };
-    this.#transcriptOverlayPreparationWaiters.push(waiter);
-    this.#drainTranscriptOverlayPreparationWaiters();
-    return { waiter, ready };
-  }
-
-  #releaseTranscriptOverlayPreparation(): void {
-    this.#preparingTranscriptOverlayBytes -= MAX_TRANSCRIPT_OVERLAY_PREPARATION_BYTES;
-    this.#drainTranscriptOverlayPreparationWaiters();
-  }
-
-  #drainTranscriptOverlayPreparationWaiters(): void {
-    if (this.#closed) return;
-    while (this.#transcriptOverlayPreparationWaiters.length > 0) {
-      const waiter = this.#transcriptOverlayPreparationWaiters[0]!;
-      if (waiter.cancelled) {
-        this.#transcriptOverlayPreparationWaiters.shift();
-        continue;
-      }
-      if (
-        this.#retainedTranscriptOverlayBytes + MAX_TRANSCRIPT_OVERLAY_PREPARATION_BYTES >
-        MAX_RETAINED_TRANSCRIPT_OVERLAY_BYTES
-      ) {
-        if (this.#preparingTranscriptOverlayBytes > 0) return;
-        this.#transcriptOverlayPreparationWaiters.shift();
-        waiter.cancelled = true;
-        waiter.reject(
-          new TranscriptOverlayCapacityError('Runtime Host transcript overlay capacity reached'),
-        );
-        continue;
-      }
-      if (
-        this.#retainedTranscriptOverlayBytes +
-          this.#preparingTranscriptOverlayBytes +
-          MAX_TRANSCRIPT_OVERLAY_PREPARATION_BYTES >
-        MAX_RETAINED_TRANSCRIPT_OVERLAY_BYTES
-      ) {
-        return;
-      }
-      this.#transcriptOverlayPreparationWaiters.shift();
-      waiter.granted = true;
-      this.#preparingTranscriptOverlayBytes += MAX_TRANSCRIPT_OVERLAY_PREPARATION_BYTES;
-      let released = false;
-      waiter.resolve(() => {
-        if (released) return;
-        released = true;
-        this.#releaseTranscriptOverlayPreparation();
-      });
-    }
-  }
-
-  #cancelTranscriptOverlayPreparation(waiter: TranscriptOverlayPreparationWaiter): void {
-    if (waiter.cancelled) return;
-    waiter.cancelled = true;
-    if (!waiter.granted) {
-      const index = this.#transcriptOverlayPreparationWaiters.indexOf(waiter);
-      if (index >= 0) this.#transcriptOverlayPreparationWaiters.splice(index, 1);
-      waiter.reject(new Error('Session transcript overlay preparation was cancelled'));
-      this.#drainTranscriptOverlayPreparationWaiters();
-    }
-  }
-
-  #cancelTranscriptOverlayPreparationWaiters(): void {
-    for (const waiter of this.#transcriptOverlayPreparationWaiters.splice(0)) {
-      waiter.cancelled = true;
-      waiter.reject(new Error('Session continuity coordinator is closed'));
-    }
-  }
-
-  #registerTranscriptOverlay(messages: readonly Buffer[]): RetainedTranscriptOverlay {
-    const bytes = messages.reduce((total, message) => total + message.byteLength, 0);
-    if (this.#retainedTranscriptOverlayBytes + bytes > MAX_RETAINED_TRANSCRIPT_OVERLAY_BYTES) {
-      throw new TranscriptOverlayCapacityError('Runtime Host transcript overlay capacity reached');
-    }
-    const retained = { messages, bytes, references: 1 };
-    this.#retainedTranscriptOverlays.set(messages, retained);
-    this.#retainedTranscriptOverlayBytes += bytes;
-    return retained;
-  }
-
-  #retainTranscriptOverlay(retained: RetainedTranscriptOverlay): void {
-    if (
-      retained.references < 1 ||
-      this.#retainedTranscriptOverlays.get(retained.messages) !== retained
-    ) {
-      throw new Error('Session transcript overlay is no longer retained');
-    }
-    retained.references += 1;
-  }
-
-  #releaseTranscriptOverlay(retained: RetainedTranscriptOverlay): void {
-    if (retained.references < 1) return;
-    retained.references -= 1;
-    if (retained.references > 0) return;
-    this.#retainedTranscriptOverlays.delete(retained.messages);
-    this.#retainedTranscriptOverlayBytes -= retained.bytes;
-    this.#drainTranscriptOverlayPreparationWaiters();
-  }
-
-  #invalidateTranscriptOverlay(
-    state: SessionProjectionState,
-    expected?: CachedTranscriptOverlay,
-  ): void {
-    const cached = state.transcriptOverlay;
-    if (!cached || (expected && cached !== expected)) return;
-    state.transcriptOverlay = undefined;
-    cached.cancelPreparation();
-    void cached.prepared.then(
-      (retained) => this.#releaseTranscriptOverlay(retained),
-      () => undefined,
-    );
-  }
-
-  #hasTranscriptOverlayConsumer(state: SessionProjectionState): boolean {
-    return (
-      (state.transcriptOverlay?.pendingConsumers ?? 0) > 0 ||
-      [...state.subscribers.values()].some(
-        (subscriber) => subscriber.retainedTranscriptOverlay !== undefined,
-      )
-    );
   }
 
   async #refreshTranscriptHighWater(
@@ -1334,6 +1174,7 @@ export class SessionContinuityCoordinator implements SessionContinuityService {
     if (!subscriber || subscriber.activated || subscriber.phase === 'closed') return;
     subscriber.activated = true;
     this.#pump(subscriber);
+    this.#pumpPty(subscriber);
   }
 
   #abortSubscription(connectionId: string, subscriptionId: string): void {
@@ -1359,7 +1200,6 @@ export class SessionContinuityCoordinator implements SessionContinuityService {
   #closeConnection(connectionId: string): void {
     const connection = this.#connections.get(connectionId);
     if (!connection) return;
-    connection.resolveClosed();
     for (const subscriptionId of [...connection.subscriptionIds]) {
       const subscriber = this.#ownedSubscriber(connectionId, subscriptionId);
       if (subscriber) this.#removeSubscriber(subscriber);
@@ -1367,7 +1207,7 @@ export class SessionContinuityCoordinator implements SessionContinuityService {
     this.#connections.delete(connectionId);
   }
 
-  #enqueue(subscriber: Subscriber, frame: SubscriptionFrame): void {
+  #enqueue(subscriber: Subscriber, frame: OrderedSubscriptionFrame): void {
     if (subscriber.phase !== 'open' || subscriber.terminalQueued) return;
     let encodedBytes: number;
     try {
@@ -1388,7 +1228,7 @@ export class SessionContinuityCoordinator implements SessionContinuityService {
     if (tail && (!subscriber.pumping || subscriber.queue.length > 1)) {
       const mergedText = mergeableAssistantDeltaText(tail.frame, frame);
       if (mergedText !== undefined && tail.frame.kind === 'subscription.session_delta') {
-        const merged: SubscriptionFrame = {
+        const merged: OrderedSubscriptionFrame = {
           ...tail.frame,
           delta: { ...tail.frame.delta, text: mergedText },
         };
@@ -1426,18 +1266,67 @@ export class SessionContinuityCoordinator implements SessionContinuityService {
   }
 
   #evictSlowSubscriber(subscriber: Subscriber): void {
+    this.#closeSubscriber(subscriber, 'slow_consumer');
+  }
+
+  #enqueuePty(subscriber: Subscriber, frame: SessionRuntimeResourcePtyDataFrame): void {
+    if (subscriber.phase !== 'open' || subscriber.terminalQueued) return;
+    let encodedBytes = encodeProtocolMessage(frame).byteLength;
+    if (subscriber.ptyQueue.length >= 8 || subscriber.ptyQueuedBytes + encodedBytes > 128 * 1024) {
+      // Reset is session-wide for terminal consumers, so one marker covers
+      // every omitted resource without an unbounded per-resource dirty set.
+      const inFlight = subscriber.ptyPumping ? subscriber.ptyQueue[0] : undefined;
+      subscriber.ptyQueue = inFlight ? [inFlight] : [];
+      subscriber.ptyQueuedBytes = inFlight?.encodedBytes ?? 0;
+      frame = { ...frame, data: '', reset: true };
+      encodedBytes = encodeProtocolMessage(frame).byteLength;
+    }
+    subscriber.ptyQueue.push({ frame, encodedBytes });
+    subscriber.ptyQueuedBytes += encodedBytes;
+    this.#pumpPty(subscriber);
+  }
+
+  #pumpPty(subscriber: Subscriber): void {
+    if (subscriber.ptyPumping || !subscriber.activated || subscriber.phase !== 'open') return;
+    const queued = subscriber.ptyQueue[0];
+    if (!queued) return;
+    subscriber.ptyPumping = true;
+    void Promise.resolve()
+      .then(() => {
+        if (subscriber.phase !== 'open') return;
+        return subscriber.sink.send(queued.frame);
+      })
+      .then(
+        () => {
+          subscriber.ptyPumping = false;
+          if (subscriber.ptyQueue[0] === queued) {
+            subscriber.ptyQueue.shift();
+            subscriber.ptyQueuedBytes -= queued.encodedBytes;
+          }
+          this.#pumpPty(subscriber);
+        },
+        () => this.#removeSubscriber(subscriber),
+      );
+  }
+
+  #closeSubscriber(
+    subscriber: Subscriber,
+    reason: 'slow_consumer' | 'access_revoked' | 'transcript_changed',
+  ): void {
     if (subscriber.phase !== 'open') return;
     subscriber.phase = 'closing';
     const inFlight = subscriber.pumping ? subscriber.queue[0] : undefined;
     subscriber.queue = [];
     subscriber.queuedBytes = 0;
+    subscriber.deferred = [];
+    subscriber.deferredBytes = 0;
     subscriber.nextSequence = (inFlight?.frame.sequence ?? subscriber.lastFlushedSequence) + 1;
     const frame: SubscriptionFrame = {
       kind: 'subscription.closed',
       hostEpoch: this.#hostEpoch,
       subscriptionId: subscriber.subscriptionId,
       sequence: subscriber.nextSequence,
-      reason: 'slow_consumer',
+      reason,
     };
     subscriber.nextSequence += 1;
     subscriber.terminalQueued = true;
@@ -1449,6 +1338,20 @@ export class SessionContinuityCoordinator implements SessionContinuityService {
     subscriber.queue.push({ frame, encodedBytes });
     subscriber.queuedBytes += encodedBytes;
     if (subscriber.activated) this.#pump(subscriber);
+  }
+
+  #canObserve(
+    identity: { readonly principalId: string; readonly principalKind: Subscriber['principalKind'] },
+    sessionId: string,
+  ): boolean {
+    return (
+      identity.principalKind !== 'session_guest' ||
+      this.#sessionAccessAuthority?.activeSessionGrant(
+        identity.principalId,
+        sessionId,
+        'session_observation',
+      ) !== undefined
+    );
   }
 
   #enqueueAssistantDelta(
@@ -1469,6 +1372,7 @@ export class SessionContinuityCoordinator implements SessionContinuityService {
     current: Pick<ActiveAssistantStream, 'turnId' | 'messageId' | 'text'>,
     kind: SessionAssistantDelta['kind'],
     finalText: string,
+    interrupted?: true,
   ): void {
     const extendsPrefix = finalText.startsWith(current.text);
     const suffix = extendsPrefix ? finalText.slice(current.text.length) : finalText;
@@ -1500,6 +1404,7 @@ export class SessionContinuityCoordinator implements SessionContinuityService {
         text: '',
         ...(!extendsPrefix && finalText.length === 0 ? { reset: true as const } : {}),
         complete: true,
+        ...(interrupted ? { interrupted: true } : {}),
       },
     });
   }
@@ -1609,6 +1514,10 @@ export class SessionContinuityCoordinator implements SessionContinuityService {
           this.#removeSubscriber(subscriber);
           return;
         }
+        if (subscriber.assistantBacklog.size > 0) {
+          const state = this.#sessions.get(subscriber.sessionId);
+          if (state) this.#payAssistantBacklog(subscriber, state);
+        }
         this.#pump(subscriber);
       },
       () => this.#removeSubscriber(subscriber),
@@ -1620,31 +1529,111 @@ export class SessionContinuityCoordinator implements SessionContinuityService {
     subscriber.phase = 'closed';
     subscriber.queue = [];
     subscriber.queuedBytes = 0;
+    subscriber.ptyQueue = [];
+    subscriber.ptyQueuedBytes = 0;
     const state = this.#sessions.get(subscriber.sessionId);
     const removed = state?.subscribers.delete(subscriber.subscriptionId);
     this.#subscriptions.delete(subscriber.subscriptionId);
     this.#connections
       .get(subscriber.connectionId)
       ?.subscriptionIds.delete(subscriber.subscriptionId);
-    this.#releaseSubscriberTranscriptOverlay(subscriber);
-    if (!this.#closed && state && removed) {
-      if (!this.#hasTranscriptOverlayConsumer(state)) this.#invalidateTranscriptOverlay(state);
-      if (state.subscribers.size === 0) {
-        this.#scheduleInactiveStateCleanup(subscriber.sessionId, state);
-      }
+    subscriber.assistantBacklog.clear();
+    subscriber.deferred = [];
+    subscriber.deferredBytes = 0;
+    if (!this.#closed && state && removed && state.subscribers.size === 0) {
+      this.#scheduleInactiveStateCleanup(subscriber.sessionId, state);
     }
   }
 
-  #releaseSubscriberTranscriptOverlay(subscriber: Subscriber): void {
-    if (subscriber.transcript) subscriber.transcript.overlayMessages = undefined;
-    const retained = subscriber.retainedTranscriptOverlay;
-    if (!retained) return;
-    subscriber.retainedTranscriptOverlay = undefined;
-    this.#releaseTranscriptOverlay(retained);
-    const state = this.#sessions.get(subscriber.sessionId);
-    if (state && !this.#hasTranscriptOverlayConsumer(state)) {
-      this.#invalidateTranscriptOverlay(state);
+  /**
+   * Sends a subscriber the in-flight assistant text it joined too late to see,
+   * one frame at a time while its queue has room. Live deltas for such a stream
+   * are withheld until the backlog catches up, so offsets stay contiguous.
+   */
+  #payAssistantBacklog(subscriber: Subscriber, state: SessionProjectionState): void {
+    const rootTurn = state.canonical.rootTurn;
+    for (const [key, backlog] of subscriber.assistantBacklog) {
+      const { completion } = backlog;
+      const stream = completion?.stream ?? state.assistantStreams.get(key);
+      const runId = completion?.runId ?? rootTurn?.runId;
+      if (!stream || !runId || (!completion && stream.turnId !== rootTurn?.turnId)) {
+        subscriber.assistantBacklog.delete(key);
+        continue;
+      }
+      while (backlog.sent < stream.text.length) {
+        if (
+          subscriber.phase !== 'open' ||
+          subscriber.queue.length >= MAX_SUBSCRIBER_QUEUED_FRAMES / 2 ||
+          subscriber.queuedBytes >= MAX_SUBSCRIBER_QUEUED_BYTES / 2
+        ) {
+          return;
+        }
+        const chunk = stream.text.slice(
+          backlog.sent,
+          backlog.sent + ASSISTANT_BACKLOG_CHUNK_CHARACTERS,
+        );
+        this.#enqueueAssistantText(
+          subscriber,
+          subscriber.sessionId,
+          runId,
+          stream,
+          stream.kind,
+          backlog.sent,
+          chunk,
+        );
+        backlog.sent += chunk.length;
+      }
+      subscriber.assistantBacklog.delete(key);
+      if (completion) {
+        this.#enqueueAssistantCompletion(
+          subscriber,
+          subscriber.sessionId,
+          runId,
+          stream,
+          stream.kind,
+          stream.text,
+          completion.interrupted,
+        );
+      }
     }
+    this.#drainDeferred(subscriber);
+  }
+
+  #completeAssistantStream(
+    subscriber: Subscriber,
+    state: SessionProjectionState,
+    runId: string,
+    key: string,
+    stream: ActiveAssistantStream,
+    finalText: string,
+    interrupted?: true,
+  ): void {
+    const backlog = subscriber.assistantBacklog.get(key);
+    const held = backlog ? stream.text.slice(0, backlog.sent) : stream.text;
+    if (backlog && finalText.startsWith(held)) {
+      backlog.completion = {
+        runId,
+        stream: { ...stream, text: finalText },
+        ...(interrupted ? { interrupted } : {}),
+      };
+      this.#payAssistantBacklog(subscriber, state);
+      return;
+    }
+    subscriber.assistantBacklog.delete(key);
+    this.#deliverInOrder(
+      subscriber,
+      () =>
+        this.#enqueueAssistantCompletion(
+          subscriber,
+          subscriber.sessionId,
+          runId,
+          { ...stream, text: held },
+          stream.kind,
+          finalText,
+          interrupted,
+        ),
+      () => Buffer.byteLength(finalText, 'utf8'),
+    );
   }
 
   #ownedSubscriber(connectionId: string, subscriptionId: string): Subscriber | undefined {
@@ -1663,7 +1652,6 @@ export class SessionContinuityCoordinator implements SessionContinuityService {
         !state.terminalPublicationFence &&
         (!state.canonical.rootTurn || isTerminalTurn(state.canonical.rootTurn))
       ) {
-        this.#invalidateTranscriptOverlay(state);
         this.#sessions.delete(sessionId);
       }
     });
@@ -1714,6 +1702,7 @@ export class SessionContinuityCoordinator implements SessionContinuityService {
       }
       const nextRevision = state.revision + 1;
       const value = createSessionContinuitySnapshot(canonical, nextRevision);
+      this.#invalidateSettledChoiceTranscript(state, canonical);
       state.canonical = canonical;
       state.revision = nextRevision;
       return { changed, state, value };
@@ -1725,10 +1714,32 @@ export class SessionContinuityCoordinator implements SessionContinuityService {
     };
   }
 
+  #invalidateSettledChoiceTranscript(
+    state: SessionProjectionState,
+    next: CanonicalSessionProjection,
+  ): void {
+    const pending = new Set(next.interactions.pending.map((item) => item.interactionId));
+    if (
+      !state.canonical.interactions.pending.some(
+        (item) =>
+          (item.request.kind === 'form' || item.request.kind === 'question') &&
+          !pending.has(item.interactionId),
+      )
+    )
+      return;
+    // Outcomes can settle after their owner's last event. Their historical rows
+    // then lie behind an already-consumed cursor: advancing the event high water
+    // cannot deliver them. Close explicitly so observers rebuild their bounded tail.
+    for (const subscriber of state.subscribers.values()) {
+      if (subscriber.transcript) this.#closeSubscriber(subscriber, 'transcript_changed');
+    }
+  }
+
   #publishCanonical(state: SessionProjectionState, canonical: CanonicalSessionProjection): void {
     if (isDeepStrictEqual(state.canonical, canonical)) return;
     const nextRevision = state.revision + 1;
     const snapshot = createSessionContinuitySnapshot(canonical, nextRevision);
+    this.#invalidateSettledChoiceTranscript(state, canonical);
     state.canonical = immutableClone(canonical);
     state.revision = nextRevision;
     this.#broadcastProjection(state, snapshot);
@@ -1736,13 +1747,51 @@ export class SessionContinuityCoordinator implements SessionContinuityService {
 
   #broadcastProjection(state: SessionProjectionState, snapshot: SessionContinuitySnapshot): void {
     for (const subscriber of state.subscribers.values()) {
-      this.#enqueue(subscriber, {
-        kind: 'subscription.session_projection',
-        hostEpoch: this.#hostEpoch,
-        subscriptionId: subscriber.subscriptionId,
-        sequence: subscriber.nextSequence,
-        snapshot,
-      });
+      this.#deliverInOrder(
+        subscriber,
+        () => {
+          this.#enqueue(subscriber, {
+            kind: 'subscription.session_projection',
+            hostEpoch: this.#hostEpoch,
+            subscriptionId: subscriber.subscriptionId,
+            sequence: subscriber.nextSequence,
+            snapshot: projectSessionSnapshot(snapshot, subscriber.principalKind),
+          });
+        },
+        () => Buffer.byteLength(JSON.stringify(snapshot), 'utf8'),
+      );
+    }
+  }
+
+  /**
+   * Runs `work` now, or behind whatever this subscriber is still catching up
+   * on. Every assistant frame and projection goes through here, so the order a
+   * subscriber sees is the order the Host produced.
+   */
+  #deliverInOrder(subscriber: Subscriber, work: () => void, bytes: () => number): void {
+    if (subscriber.phase !== 'open') return;
+    if (subscriber.assistantBacklog.size === 0 && subscriber.deferred.length === 0) {
+      work();
+      return;
+    }
+    const size = bytes();
+    if (subscriber.queuedBytes + subscriber.deferredBytes + size > MAX_SUBSCRIBER_QUEUED_BYTES) {
+      this.#evictSlowSubscriber(subscriber);
+      return;
+    }
+    subscriber.deferred.push({ work, bytes: size });
+    subscriber.deferredBytes += size;
+  }
+
+  #drainDeferred(subscriber: Subscriber): void {
+    while (
+      subscriber.assistantBacklog.size === 0 &&
+      subscriber.deferred.length > 0 &&
+      subscriber.phase === 'open'
+    ) {
+      const next = subscriber.deferred.shift()!;
+      subscriber.deferredBytes -= next.bytes;
+      next.work();
     }
   }
 
@@ -1925,6 +1974,37 @@ function jsonStringContentBytes(value: string): number {
   return Buffer.byteLength(encoded.slice(1, -1), 'utf8');
 }
 
+function connectionIdentity(context: ConnectionContext): {
+  readonly principalId: string;
+  readonly principalKind: Subscriber['principalKind'];
+} {
+  if (!context.principalKind) {
+    throw new Error('Runtime Host connection has no authenticated principal kind');
+  }
+  return { principalId: context.principal, principalKind: context.principalKind };
+}
+
+function projectSessionSnapshot(
+  snapshot: SessionContinuitySnapshot,
+  principalKind: Subscriber['principalKind'],
+): SessionContinuitySnapshot {
+  if (principalKind !== 'session_guest') return snapshot;
+  const projectEntry = <T extends { readonly content: import('@maka/core/events').MessageContent }>(
+    entry: T,
+  ): T => ({
+    ...entry,
+    content: projectSharedSessionMessageContent(entry.content, snapshot.session.sessionId),
+  });
+  return {
+    ...snapshot,
+    queue: {
+      ...snapshot.queue,
+      steering: snapshot.queue.steering.map(projectEntry),
+      followup: snapshot.queue.followup.map(projectEntry),
+    },
+  };
+}
+
 function projectSessionEvent(
   event: Exclude<
     RuntimeSessionForwardedEvent,
@@ -1937,6 +2017,8 @@ function projectSessionEvent(
         | 'provider_retry';
     }
   >,
+  sessionId: string,
+  shared = false,
 ): SessionToolEvent | SessionSteeringEvent {
   if (event.type === 'steering_message') {
     // The durable steering echo: forwarded verbatim so subscribers render the
@@ -1948,7 +2030,9 @@ function projectSessionEvent(
       turnId: event.turnId,
       ts: event.ts,
       messageId: event.messageId,
-      content: structuredClone(event.content),
+      content: shared
+        ? projectSharedSessionMessageContent(event.content, sessionId)
+        : structuredClone(event.content),
     };
   }
   const identity = {
@@ -2053,20 +2137,14 @@ function toolStartShellRunRef(
   if (event.toolName !== 'Read' && event.toolName !== 'StopBackgroundTask') return undefined;
   const ref =
     event.args !== null && typeof event.args === 'object'
-      ? (event.args as { ref?: unknown }).ref
+      ? event.toolName === 'Read'
+        ? (event.args as { path?: unknown }).path
+        : (event.args as { ref?: unknown }).ref
       : undefined;
   if (typeof ref !== 'string') return undefined;
   try {
-    return decodeRuntimeResourceRef(ref);
+    return decodeRuntimeResourceRef(resolveReadInput({ path: ref }).path);
   } catch {
     return undefined;
   }
-}
-
-function signal(): { readonly promise: Promise<void>; resolve(): void } {
-  let resolve!: () => void;
-  const promise = new Promise<void>((settle) => {
-    resolve = settle;
-  });
-  return { promise, resolve };
 }

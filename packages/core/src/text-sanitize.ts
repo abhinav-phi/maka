@@ -20,10 +20,10 @@
 /**
  * Unicode text-sanitize pipeline — single source of truth (#1404).
  *
- * `session-name.ts` and `foreign-session.ts` each used to carry their own copy
+ * Session naming and external Session import each used to carry their own copy
  * of the "NFC + control/bidi/zero-width + whitespace-collapse + code-point
  * cap" pipeline, and the two had drifted: `session-name` was missing 8 code
- * points that `foreign-session` (and its own `FOREIGN_UNSAFE_CHARS` id guard)
+ * points that the former external-session scanner
  * already covered. This module is the one place that pipeline lives now.
  *
  * Boundary: this helper does ONE thing — given an already-type-checked string,
@@ -91,7 +91,7 @@ export interface SanitizeUnicodeOptions {
  *
  * Pipeline (applied in order): NFC → control chars → space, bidi format →
  * space, zero-width/invisible → removed, whitespace collapse, trim, then
- * code-point cap. The cap uses `Array.from(...)` to iterate by code points so a
+ * code-point cap. The cap iterates by code points so a
  * surrogate pair (e.g. `🦊` = U+1F98A, two UTF-16 code units) counts as one and
  * is never split in half.
  *
@@ -107,7 +107,30 @@ export function sanitizeUnicodeText(text: string, opts: SanitizeUnicodeOptions):
     .replace(ZERO_WIDTH_REGEX, '')
     .replace(/\s+/g, ' ')
     .trim();
-  const points = Array.from(cleaned);
+  const points: string[] = [];
+  for (const point of cleaned) {
+    points.push(point);
+    // One extra point detects truncation without expanding the entire input.
+    if (opts.maxCodePoints >= 0 && points.length > opts.maxCodePoints) break;
+  }
   if (points.length <= opts.maxCodePoints) return cleaned;
   return points.slice(0, opts.maxCodePoints).join('') + suffix;
+}
+
+/**
+ * Truncate to at most `maxUnits` UTF-16 code units without ending on an
+ * unpaired high surrogate: when the cut lands inside a surrogate pair, the
+ * dangling high half is dropped with the rest of the clipped tail, so the
+ * result survives a UTF-8 round trip (durable storage, model requests)
+ * instead of decoding as U+FFFD.
+ *
+ * Budgets here are code *units*, not code points — callers clip against
+ * provider/storage limits measured in UTF-16 lengths. Marker/suffix policy
+ * stays with the caller, per the boundary note above.
+ */
+export function truncateUtf16Safe(text: string, maxUnits: number): string {
+  if (maxUnits <= 0) return '';
+  if (text.length <= maxUnits) return text;
+  const kept = text.slice(0, maxUnits);
+  return /[\uD800-\uDBFF]$/.test(kept) ? kept.slice(0, -1) : kept;
 }

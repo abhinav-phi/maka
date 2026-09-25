@@ -29,7 +29,10 @@ import {
   type ScheduledTaskChangedFrame,
   type SubscriptionOpenInput,
 } from '../protocol/index.js';
-import type { ClientCapabilityProvider } from './client-capability.js';
+import type {
+  ClientCapabilityProvider,
+  ClientCapabilityRegistrationOptions,
+} from './client-capability.js';
 import {
   RuntimeHostOperationError,
   RuntimeHostRequestInterruptedError,
@@ -46,6 +49,10 @@ import type { RuntimeHostSessionSubscription } from './session-subscription.js';
 
 export interface RuntimeHostReconnectingConnection extends RuntimeHostConnection {
   readonly reconnecting: true;
+  openSessionSubscriptionOnce(
+    input: SubscriptionOpenInput,
+    timeoutMs?: number,
+  ): Promise<RuntimeHostSessionSubscription>;
   subscribeConnectionAvailability(
     listener: (availability: RuntimeHostConnectionAvailability) => void,
   ): () => void;
@@ -118,6 +125,7 @@ class RuntimeHostReconnectingConnectionImpl implements RuntimeHostReconnectingCo
   readonly #connectionAvailabilityListeners = new Set<
     (availability: RuntimeHostConnectionAvailability) => void
   >();
+  readonly #connectionCatalogListeners = new Set<(revision: number) => void>();
   readonly #projectListeners = new Set<(revision: number) => void>();
   readonly #sessionListeners = new Set<(frame: SessionCatalogChangedFrame) => void>();
   readonly #scheduledTaskListeners = new Set<(frame: ScheduledTaskChangedFrame) => void>();
@@ -211,19 +219,26 @@ class RuntimeHostReconnectingConnectionImpl implements RuntimeHostReconnectingCo
     }
   }
 
+  openSessionSubscriptionOnce(
+    input: SubscriptionOpenInput,
+    timeoutMs?: number,
+  ): Promise<RuntimeHostSessionSubscription> {
+    return this.#requireCurrent('subscription.open').openSessionSubscription(input, timeoutMs);
+  }
+
   async replaceClientCapabilities(
     provider: ClientCapabilityProvider,
-    timeoutMs?: number,
+    options?: number | ClientCapabilityRegistrationOptions,
   ): Promise<ClientCapabilityReplaceResult> {
     const connection = this.#requireCurrent('client.capability.replace');
-    return connection.replaceClientCapabilities(provider, timeoutMs);
+    return connection.replaceClientCapabilities(provider, options);
   }
 
   async unregisterClientCapabilities(
-    timeoutMs?: number,
+    options?: number | ClientCapabilityRegistrationOptions,
   ): Promise<ClientCapabilityUnregisterResult> {
     const connection = this.#requireCurrent('client.capability.unregister');
-    return connection.unregisterClientCapabilities(timeoutMs);
+    return connection.unregisterClientCapabilities(options);
   }
 
   subscribeConfigurationChanges(listener: (revision: number) => void): () => void {
@@ -241,6 +256,11 @@ class RuntimeHostReconnectingConnectionImpl implements RuntimeHostReconnectingCo
       // A presentation listener cannot invalidate the Host connection.
     }
     return () => this.#connectionAvailabilityListeners.delete(listener);
+  }
+
+  subscribeConnectionCatalogChanges(listener: (revision: number) => void): () => void {
+    this.#connectionCatalogListeners.add(listener);
+    return () => this.#connectionCatalogListeners.delete(listener);
   }
 
   subscribeProjectCatalogChanges(listener: (revision: number) => void): () => void {
@@ -338,6 +358,9 @@ class RuntimeHostReconnectingConnectionImpl implements RuntimeHostReconnectingCo
     this.#listenerDisposers = [
       connection.subscribeConfigurationChanges((revision: number) => {
         notify(this.#configurationListeners, revision);
+      }),
+      connection.subscribeConnectionCatalogChanges((revision: number) => {
+        notify(this.#connectionCatalogListeners, revision);
       }),
       connection.subscribeProjectCatalogChanges((revision: number) => {
         notify(this.#projectListeners, revision);

@@ -52,7 +52,7 @@ interface QuietPreviewStrings {
 }
 
 const STRINGS_BY_LOCALE: Record<UiLocale, QuietPreviewStrings> = {
-  zh: {
+  'zh-CN': {
     backgroundTerminal: '后台终端交互',
     empty: '（空）',
     done: '已完成',
@@ -61,6 +61,16 @@ const STRINGS_BY_LOCALE: Record<UiLocale, QuietPreviewStrings> = {
     written: '已写入',
     bytes: (n) => `共 ${n} 字节`,
     moreQuestions: (total) => (total > 1 ? ` 等 ${total} 问` : ''),
+  },
+  'zh-TW': {
+    backgroundTerminal: '後臺終端互動',
+    empty: '（空）',
+    done: '已完成',
+    notDone: '未完成',
+    replacements: (n) => `${n} 處`,
+    written: '已寫入',
+    bytes: (n) => `共 ${n} 位元組`,
+    moreQuestions: (total) => (total > 1 ? ` 等 ${total} 問` : ''),
   },
   en: {
     backgroundTerminal: 'Background terminal interaction',
@@ -75,7 +85,7 @@ const STRINGS_BY_LOCALE: Record<UiLocale, QuietPreviewStrings> = {
 };
 
 function strings(locale: UiLocale): QuietPreviewStrings {
-  return STRINGS_BY_LOCALE[locale] ?? STRINGS_BY_LOCALE.zh;
+  return STRINGS_BY_LOCALE[locale] ?? STRINGS_BY_LOCALE['zh-CN'];
 }
 
 // ── Tool command extraction ──────────────────────────────────────────────
@@ -230,7 +240,7 @@ export interface ToolInvocationInput {
  */
 export function formatToolInvocationLine(
   item: ToolInvocationInput,
-  locale: UiLocale = 'zh',
+  locale: UiLocale,
 ): string | undefined {
   const s = strings(locale);
   const args = asRecord(item.args);
@@ -257,14 +267,6 @@ export function formatToolInvocationLine(
     const rows = size ? numberField(size, 'rows') : undefined;
     if (cols !== undefined && rows !== undefined) parts.push(`${cols}x${rows}`);
     return parts.join(' · ');
-  }
-
-  if (name === 'deep_research_start') {
-    const objective = stringField(args, 'objective');
-    if (objective) {
-      const scopeLevel = stringField(args, 'scope_level');
-      return redactSecrets(scopeLevel ? `${objective} (${scopeLevel})` : objective);
-    }
   }
 
   if (name === 'GoalSet') {
@@ -328,7 +330,7 @@ const ARGS_PREVIEW_MAX_CHARS = 2048;
 /** Question lists keep only their leading entries. */
 const ARGS_PREVIEW_LIST_MAX_ITEMS = 4;
 
-const TASK_LEDGER_TOOL_NAMES = new Set(['task_create', 'task_update', 'task_list', 'task_get']);
+const COMMIT_RESULT_ONLY_TOOL_NAMES = new Set(['todo_write']);
 
 /**
  * Whitelist of scalar args keys {@link formatToolInvocationLine} can read, in
@@ -354,11 +356,6 @@ const ARGS_PREVIEW_SCALAR_KEYS = [
   'id',
   'ref',
 ] as const;
-
-// This tool's objective is the compact row's durable headline. Keep it
-// explicit rather than widening the generic wire allowlist with a broad key
-// such as `input`: non-WriteStdin tools otherwise retain arbitrary payloads.
-const DEEP_RESEARCH_START_PREVIEW_SCALAR_KEYS = ['objective', 'scope_level'] as const;
 
 const ARGS_PREVIEW_NUMBER_KEYS = ['offset', 'limit'] as const;
 
@@ -435,21 +432,17 @@ export function projectToolArgsPreview(
 ): Record<string, unknown> | undefined {
   const record = asRecord(args);
   if (!record) return undefined;
-  // Task rows need committed IDs and the exact Task Ledger mutation snapshot;
-  // args alone cannot identify the user-facing task reliably. Keep them out of
-  // the generic live preview until the Host-owned semantic timeline (#4179).
-  if (TASK_LEDGER_TOOL_NAMES.has(toolName)) return undefined;
+  // A Todo write's args are only a proposal. Showing them while the call is
+  // live would present uncommitted state as fact; the settled tool_result owns
+  // the complete committed snapshot.
+  if (COMMIT_RESULT_ONLY_TOOL_NAMES.has(toolName)) return undefined;
 
   // Apply the canonical activity projection first so WriteStdin's inputPreview
   // shape (bounded, display-safe) is what the whitelist picks up.
   const projected = asRecord(projectToolActivityArgs(toolName, args)) ?? record;
-  const scalarKeys =
-    toolName === 'deep_research_start'
-      ? [...ARGS_PREVIEW_SCALAR_KEYS, ...DEEP_RESEARCH_START_PREVIEW_SCALAR_KEYS]
-      : ARGS_PREVIEW_SCALAR_KEYS;
 
   const picked = new Map<string, unknown>();
-  for (const key of scalarKeys) {
+  for (const key of ARGS_PREVIEW_SCALAR_KEYS) {
     if (isSensitiveKey(key)) continue;
     const value = previewStringField(projected, key);
     if (value !== undefined) picked.set(key, value);
@@ -482,7 +475,7 @@ export function projectToolArgsPreview(
   // Enforce the whole-preview budget by dropping lowest-priority fields; the
   // first picked (highest-priority) field always survives.
   const keysByPriority = [
-    ...scalarKeys,
+    ...ARGS_PREVIEW_SCALAR_KEYS,
     ...ARGS_PREVIEW_NUMBER_KEYS,
     'inputPreview',
     'size',
@@ -518,7 +511,7 @@ export interface QuietPreview {
  * Primary list/text fields become the main body; remaining fields (error, ok,
  * truncated, …) are appended so diagnostics cannot vanish.
  */
-export function formatQuietJsonValue(value: unknown, locale: UiLocale = 'zh'): QuietPreview {
+export function formatQuietJsonValue(value: unknown, locale: UiLocale): QuietPreview {
   const s = strings(locale);
   if (value === null || value === undefined) {
     return { body: s.empty };
@@ -676,8 +669,8 @@ function formatArrayAsBody(values: unknown[], locale: UiLocale): string {
  */
 export function formatAsKeyValueLines(
   record: Record<string, unknown>,
-  depth = 0,
-  locale: UiLocale = 'zh',
+  depth: number,
+  locale: UiLocale,
 ): string {
   const s = strings(locale);
   if (depth > 3) return redactSecrets(String(record));

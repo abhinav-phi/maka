@@ -17,13 +17,20 @@
  * under the License.
  */
 
+import type { InteractionFormInput, InteractionFormResult } from '@maka/core/interaction';
 import type {
   ClientCapabilityCallFrame,
   ClientCapabilityCallResult,
+  ClientCapabilityAdmissionEvidence,
   ClientCapabilityOffer,
   ClientCapabilityServiceCallFrame,
   ClientCapabilityServiceOffer,
 } from '../protocol/index.js';
+
+export interface ClientCapabilityRegistrationOptions {
+  readonly sessionId?: string;
+  readonly timeoutMs?: number;
+}
 
 /** A Client-owned open-world capability provider registered on one Host connection. */
 export interface ClientCapabilityProvider {
@@ -34,9 +41,11 @@ export interface ClientCapabilityProvider {
     options: {
       readonly signal: AbortSignal;
       /** Await immediately before crossing the provider's irreversible admission cut. */
-      accept(): Promise<void>;
+      accept(evidence: ClientCapabilityAdmissionEvidence): Promise<void>;
       /** Publish bounded live progress after admission. */
       progress?(current: number, total: number): void;
+      /** Request one Host-owned form after the invocation is admitted. */
+      requestInteraction(form: InteractionFormInput): Promise<InteractionFormResult>;
     },
   ): Promise<ClientCapabilityCallResult>;
   callService?(
@@ -44,9 +53,11 @@ export interface ClientCapabilityProvider {
     options: {
       readonly signal: AbortSignal;
       /** Await immediately before crossing the provider's irreversible admission cut. */
-      accept(): Promise<void>;
+      accept(evidence: ClientCapabilityAdmissionEvidence): Promise<void>;
     },
   ): Promise<Record<string, unknown>>;
   /** Release provider-owned resources after its final registration is retired. */
   close?(): void | Promise<void>;
+  /** The Host authoritatively retired this provider while its registration was current. */
+  currentRegistrationRetired?(): void | Promise<void>;
 }

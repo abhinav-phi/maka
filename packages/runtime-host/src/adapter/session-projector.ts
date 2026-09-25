@@ -18,32 +18,37 @@
  */
 
 import { isDeepStrictEqual } from 'node:util';
-import type { ActiveInteractionRequestEvent, SessionEvent } from '@maka/core/events';
+import {
+  type ActiveInteractionRequestEvent,
+  type ContextCompactionStartedEvent,
+  foldAssistantDelta,
+  type SessionEvent,
+} from '@maka/core/events';
 import type { StoredMessage, TurnRecord } from '@maka/core/session';
 import type {
   InteractionPendingSnapshot,
   SessionContinuitySnapshot,
-  SessionAssistantDelta,
   SessionAssistantStreamIdentity,
   SessionMessageQueueProjection,
   SessionSteeringEvent,
-  SteeringMessageSnapshot,
   SubscriptionFrame,
   LiveTurnSnapshot,
   TurnSnapshot,
 } from '../protocol/index.js';
 
 interface AssistantAccumulator {
+  interrupted?: true;
   kind: 'text' | 'thinking';
   turnId: string;
   messageId: string;
   text: string;
   complete: boolean;
-  replacing: boolean;
+  /** A Host reset replaced the streamed text; its deltas are withheld until completion. */
+  replaced: boolean;
 }
 
 export interface RuntimeHostSessionProjectionSeed {
-  readonly durableSteeringMessages: readonly {
+  readonly durableUserMessages: readonly {
     readonly messageId: string;
     readonly turnId: string;
   }[];
@@ -55,10 +60,9 @@ export function createRuntimeHostSessionProjectionSeed(
   snapshot: SessionContinuitySnapshot,
 ): RuntimeHostSessionProjectionSeed {
   return {
-    durableSteeringMessages: transcript
+    durableUserMessages: transcript
       .filter(
-        (message): message is Extract<StoredMessage, { type: 'user' }> =>
-          message.type === 'user' && message.steeringEventId !== undefined,
+        (message): message is Extract<StoredMessage, { type: 'user' }> => message.type === 'user',
       )
       .map((message) => ({ messageId: message.id, turnId: message.turnId })),
     activeAssistantMessages:
@@ -87,12 +91,9 @@ export interface RuntimeHostProjectionUpdate {
 export class RuntimeHostSessionProjector {
   #snapshot: SessionContinuitySnapshot;
   readonly #now: () => number;
-  readonly #durableSteeringTurnByMessage: Map<string, string>;
-  // Only live/synthesized messages for the current root belong here. Durable
-  // transcript identity stays in the admission map above, so this render
-  // ledger cannot grow with the lifetime of the session.
-  readonly #renderedSteeringMessageIds = new Set<string>();
+  readonly #durableTurnByMessage: Map<string, string>;
   readonly #accumulators = new Map<string, AssistantAccumulator>();
+  readonly #placedSteeringMessageIds = new Set<string>();
   #projectMessageAdmissions: boolean;
 
   constructor(
@@ -104,8 +105,8 @@ export class RuntimeHostSessionProjector {
   ) {
     this.#snapshot = structuredClone(snapshot);
     this.#now = now;
-    this.#durableSteeringTurnByMessage = new Map(
-      seed.durableSteeringMessages.map(({ messageId, turnId }) => [messageId, turnId]),
+    this.#durableTurnByMessage = new Map(
+      seed.durableUserMessages.map(({ messageId, turnId }) => [messageId, turnId]),
     );
     this.#projectMessageAdmissions = projectMessageAdmissions;
     const root = snapshot.rootTurn;
@@ -119,17 +120,18 @@ export class RuntimeHostSessionProjector {
           messageId: message.id,
           text: message.thinking.text,
           complete: true,
-          replacing: false,
+          replaced: false,
         });
       }
-      if (message.text) {
+      if (message.text || message.interrupted) {
         this.#accumulators.set(accumulatorKey('text', message.id), {
           kind: 'text',
           turnId: root.turnId,
           messageId: message.id,
           text: message.text,
+          ...(message.interrupted ? { interrupted: true } : {}),
           complete: true,
-          replacing: false,
+          replaced: false,
         });
       }
     }
@@ -143,7 +145,7 @@ export class RuntimeHostSessionProjector {
         messageId: stream.messageId,
         text: current?.text ?? '',
         complete: false,
-        replacing: false,
+        replaced: false,
       });
     }
   }
@@ -160,18 +162,27 @@ export class RuntimeHostSessionProjector {
     const root = this.#snapshot.rootTurn;
     if (!root) return [];
     const events: SessionEvent[] = [];
+    const queueEvents =
+      this.#projectMessageAdmissions || queueHasEntries(this.#snapshot.queue)
+        ? [projectQueueUpdate(this.#unplacedQueue(this.#snapshot.queue), root.turnId, this.#now())]
+        : [];
     if (this.#projectMessageAdmissions) {
       events.push(
         ...projectMessageAdmissionEvents(
           root,
-          [...this.#durableSteeringTurnByMessage]
+          [...this.#durableTurnByMessage]
             .filter(([, turnId]) => turnId === root.turnId)
             .map(([messageId]) => messageId),
           this.#now(),
         ),
       );
     }
-    if (isRuntimeHostTerminalTurn(root)) return events;
+    if (isRuntimeHostTerminalTurn(root)) return [...events, ...queueEvents];
+    // Re-derive the running compaction row on reconnect / restart: the Host keeps
+    // the compaction Turn alive, so a reconnecting client learns of it here.
+    if (root.rootExecutionKind === 'context_compact') {
+      events.push(contextCompactionStartedEvent(root, this.#now()));
+    }
     let seededAssistantText = false;
     if (includeAssistantText) {
       for (const accumulator of this.#accumulators.values()) {
@@ -194,38 +205,19 @@ export class RuntimeHostSessionProjector {
     for (const interaction of this.#snapshot.interactions.pending) {
       events.push(...projectRuntimeHostInteractionRequest(interaction, this.#now()));
     }
-    for (const entry of rootQueueInFlight(this.#snapshot.queue)) {
-      if (
-        this.#durableSteeringTurnByMessage.has(entry.messageId) ||
-        this.#renderedSteeringMessageIds.has(entry.messageId)
-      )
-        continue;
-      this.#renderedSteeringMessageIds.add(entry.messageId);
-      events.push({
-        type: 'steering_message',
-        id: `host-queue:${this.#snapshot.queue.hostEpoch}:${this.#snapshot.queue.queueRevision}:${entry.entryId}`,
-        turnId: root.turnId,
-        messageId: entry.messageId,
-        ts: this.#now(),
-        content: structuredClone(entry.content),
-      });
-    }
-    if (queueHasEntries(this.#snapshot.queue)) {
-      events.push(projectQueueUpdate(this.#snapshot.queue, root.turnId, this.#now()));
-    }
-    return events;
+    return [...events, ...queueEvents];
   }
 
   noteDurableTranscriptMessages(messages: readonly StoredMessage[]): SessionEvent[] {
     const events: SessionEvent[] = [];
     for (const message of messages) {
-      if (message.type !== 'user' || message.steeringEventId === undefined) continue;
-      const previousTurnId = this.#durableSteeringTurnByMessage.get(message.id);
-      this.#durableSteeringTurnByMessage.set(message.id, message.turnId);
+      if (message.type !== 'user') continue;
+      const previousTurnId = this.#durableTurnByMessage.get(message.id);
+      this.#durableTurnByMessage.set(message.id, message.turnId);
       if (!this.#projectMessageAdmissions || previousTurnId === message.turnId) continue;
       events.push({
         type: 'message_admission',
-        id: `host-admission:${message.steeringEventId}`,
+        id: `host-admission:${message.turnId}:${message.id}`,
         turnId: message.turnId,
         ts: this.#now(),
         messageId: message.id,
@@ -262,7 +254,7 @@ export class RuntimeHostSessionProjector {
           text: message.thinking.text,
         });
       }
-      if (message.text) {
+      if (message.text || message.interrupted) {
         events.push({
           type: 'text_complete',
           id: `${terminal.id}:text:${message.id}`,
@@ -270,6 +262,7 @@ export class RuntimeHostSessionProjector {
           messageId: message.id,
           ts: terminal.ts,
           text: message.text,
+          ...(message.interrupted ? { interrupted: true } : {}),
         });
       }
     }
@@ -351,14 +344,15 @@ export class RuntimeHostSessionProjector {
       const key = accumulatorKey(delta.kind, delta.messageId);
       const current = this.#accumulators.get(key);
       const folded = foldRuntimeHostAssistantDelta(delta.reset ? '' : (current?.text ?? ''), delta);
-      const replacing = delta.reset === true || (current?.replacing ?? false);
+      const replaced = delta.reset === true || (current?.replaced ?? false);
       this.#accumulators.set(key, {
         kind: delta.kind,
         turnId: delta.turnId,
         messageId: delta.messageId,
         text: folded.text,
+        ...(delta.interrupted ? { interrupted: true } : {}),
         complete: delta.complete === true,
-        replacing: delta.complete === true ? false : replacing,
+        replaced,
       });
       if (delta.complete === true) {
         events.push({
@@ -368,8 +362,9 @@ export class RuntimeHostSessionProjector {
           messageId: delta.messageId,
           ts: this.#now(),
           text: folded.text,
+          ...(delta.interrupted ? { interrupted: true } : {}),
         });
-      } else if (folded.tail && !replacing) {
+      } else if (folded.tail && !replaced) {
         events.push({
           type: delta.kind === 'text' ? 'text_delta' : 'thinking_delta',
           id: frameIdentity(frame),
@@ -385,13 +380,12 @@ export class RuntimeHostSessionProjector {
     if (frame.kind === 'subscription.session_event') {
       const event = projectSessionEvent(frame);
       if (event.type === 'steering_message') {
-        if (
-          this.#durableSteeringTurnByMessage.has(event.messageId) ||
-          this.#renderedSteeringMessageIds.has(event.messageId)
-        ) {
-          return emptyUpdate(events);
+        if (this.#durableTurnByMessage.has(event.messageId)) return emptyUpdate(events);
+        this.#placedSteeringMessageIds.add(event.messageId);
+        const { queue, rootTurn } = this.#snapshot;
+        if (rootTurn && queue.steering.some((entry) => entry.messageId === event.messageId)) {
+          events.push(projectQueueUpdate(this.#unplacedQueue(queue), rootTurn.turnId, this.#now()));
         }
-        this.#renderedSteeringMessageIds.add(event.messageId);
       }
       events.push(event);
       return emptyUpdate(events);
@@ -406,37 +400,27 @@ export class RuntimeHostSessionProjector {
     const root = next.rootTurn;
     const startedTurn =
       root && (!previousRoot || root.runId !== previousRoot.runId) ? root : undefined;
-    if (startedTurn) this.#renderedSteeringMessageIds.clear();
     for (const interaction of newlyPendingInteractions(previousSnapshot, next)) {
       events.push(...projectRuntimeHostInteractionRequest(interaction, this.#now()));
     }
-    const enteredActiveTurn =
-      root && queueChanged(previousSnapshot.queue, next.queue)
-        ? newlyInFlight(previousSnapshot.queue, next.queue)
-        : [];
-    if (this.#projectMessageAdmissions) {
-      events.push(...projectMessageRetractionEvents(previousSnapshot, next, this.#now()));
-    }
     if (root && queueChanged(previousSnapshot.queue, next.queue)) {
-      for (const entry of enteredActiveTurn) {
-        if (
-          this.#durableSteeringTurnByMessage.has(entry.messageId) ||
-          this.#renderedSteeringMessageIds.has(entry.messageId)
-        )
-          continue;
-        this.#renderedSteeringMessageIds.add(entry.messageId);
-        events.push({
-          type: 'steering_message',
-          id: `host-queue:${next.queue.hostEpoch}:${next.queue.queueRevision}:${entry.entryId}`,
-          turnId: root.turnId,
-          messageId: entry.messageId,
-          ts: this.#now(),
-          content: structuredClone(entry.content),
-        });
-      }
-      events.push(projectQueueUpdate(next.queue, root.turnId, this.#now()));
+      events.push(projectQueueUpdate(this.#unplacedQueue(next.queue), root.turnId, this.#now()));
     }
     if (startedTurn) this.#accumulators.clear();
+    // Emit the presentation-only compaction-started event when the root Turn
+    // FIRST becomes a `context_compact` run, not only when the runId changes.
+    // The real lifecycle is `admitted (no rootExecutionKind) → running/
+    // context_compact` at the SAME runId, so gating on startedTurn would miss
+    // the live transition and only surface the row on reconnect via seedActive.
+    const rootIsCompaction =
+      !!root && !isRuntimeHostTerminalTurn(root) && root.rootExecutionKind === 'context_compact';
+    const previousWasCompaction =
+      !!previousRoot &&
+      !isRuntimeHostTerminalTurn(previousRoot) &&
+      previousRoot.rootExecutionKind === 'context_compact';
+    if (root && rootIsCompaction && !previousWasCompaction) {
+      events.push(contextCompactionStartedEvent(root, this.#now()));
+    }
     const retry = liveProviderRetryEvent(previousRoot, root, this.#now());
     if (retry) events.push(retry);
     const terminalTurn =
@@ -464,6 +448,7 @@ export class RuntimeHostSessionProjector {
         messageId: accumulator.messageId,
         ts: this.#now(),
         text: accumulator.text,
+        ...(accumulator.interrupted ? { interrupted: true } : {}),
       });
     }
     if (root.status === 'completed') {
@@ -473,6 +458,13 @@ export class RuntimeHostSessionProjector {
         turnId: root.turnId,
         ts: this.#now(),
         stopReason: 'end_turn',
+        // Forward the typed compaction outcome already carried by the canonical
+        // Turn snapshot so the renderer can settle the running toast and show the
+        // terminal state. This projects an existing snapshot field (no turn-state
+        // persistence), so checkpointId stays a string.
+        ...(root.contextCompactionOutcome
+          ? { contextCompactionOutcome: root.contextCompactionOutcome }
+          : {}),
       });
     } else if (root.status === 'failed') {
       events.push({
@@ -483,9 +475,6 @@ export class RuntimeHostSessionProjector {
         recoverable: false,
         reason: root.failureClass,
         message: root.failureMessage ?? `Turn failed: ${root.failureClass}`,
-        ...(root.contextBudgetExhaustedDetail
-          ? { details: { contextBudgetExhaustedDetail: root.contextBudgetExhaustedDetail } }
-          : {}),
       });
     } else {
       events.push({
@@ -497,6 +486,17 @@ export class RuntimeHostSessionProjector {
       });
     }
     return events;
+  }
+
+  // The runtime writes a steering message before the Host acknowledges its
+  // lease, so the queue can still list an entry the timeline already shows.
+  #unplacedQueue(queue: SessionMessageQueueProjection): SessionMessageQueueProjection {
+    const steering = queue.steering.filter(
+      (entry) =>
+        !this.#placedSteeringMessageIds.has(entry.messageId) &&
+        !this.#durableTurnByMessage.has(entry.messageId),
+    );
+    return steering.length === queue.steering.length ? queue : { ...queue, steering };
   }
 }
 
@@ -519,26 +519,22 @@ function projectMessageAdmissionEvents(
   }));
 }
 
-function projectMessageRetractionEvents(
-  previous: SessionContinuitySnapshot,
-  next: SessionContinuitySnapshot,
-  ts: number,
-): SessionEvent[] {
-  const root = next.rootTurn ?? previous.rootTurn;
-  if (!root || previous.queue.hostEpoch !== next.queue.hostEpoch) return [];
-  const retained = new Set(
-    [...next.queue.steering, ...next.queue.followup].map((entry) => entry.messageId),
-  );
-  return [...previous.queue.steering, ...previous.queue.followup]
-    .filter((entry) => entry.state === 'queued' && !retained.has(entry.messageId))
-    .map((entry) => ({
-      type: 'message_admission' as const,
-      id: `host-retraction:${next.queue.hostEpoch}:${next.queue.queueRevision}:${entry.messageId}`,
-      turnId: root.turnId,
-      ts,
-      messageId: entry.messageId,
-      outcome: 'retracted' as const,
-    }));
+/**
+ * Presentation-only event that drives the renderer's live "compacting" row.
+ * Emitted on both the live transition (`accept`) and reconnect (`seedActive`)
+ * with a deterministic id keyed on the run, so a reconnect re-emits it
+ * idempotently.
+ */
+function contextCompactionStartedEvent(
+  turn: { runId: string; turnId: string },
+  now: number,
+): ContextCompactionStartedEvent {
+  return {
+    type: 'context_compaction_started',
+    id: `host-compaction-started:${turn.runId}`,
+    turnId: turn.turnId,
+    ts: now,
+  };
 }
 
 export function projectRuntimeHostInteractionRequest(
@@ -567,6 +563,17 @@ export function projectRuntimeHostInteractionRequest(
       },
     ];
   }
+  if (interaction.request.kind === 'form') {
+    return [
+      {
+        type: 'form_request',
+        ...base,
+        message: interaction.request.message,
+        requester: structuredClone(interaction.request.requester),
+        fields: structuredClone(interaction.request.fields),
+      },
+    ];
+  }
   if (interaction.request.kind === 'sandbox_boundary') {
     return [
       {
@@ -574,6 +581,16 @@ export function projectRuntimeHostInteractionRequest(
         ...base,
         justification: interaction.request.justification,
         expansion: interaction.request.expansion,
+      },
+    ];
+  }
+  if (interaction.request.kind === 'client_capability') {
+    return [
+      {
+        type: 'client_capability_request',
+        ...base,
+        capability: interaction.request.target.capability,
+        scope: structuredClone(interaction.request.target.scope),
       },
     ];
   }
@@ -659,19 +676,16 @@ function projectSessionEvent(
 
 export function foldRuntimeHostAssistantDelta(
   current: string,
-  delta: Pick<SessionAssistantDelta, 'startOffset' | 'text'>,
+  delta: { readonly startOffset?: number; readonly text: string },
 ): { text: string; tail: string } {
-  if (delta.startOffset > current.length) throw new Error('Runtime Host assistant delta has a gap');
-  const overlapLength = Math.min(current.length - delta.startOffset, delta.text.length);
-  if (
-    overlapLength > 0 &&
-    current.slice(delta.startOffset, delta.startOffset + overlapLength) !==
-      delta.text.slice(0, overlapLength)
-  ) {
+  const folded = foldAssistantDelta(current.length, delta);
+  if (!folded) throw new Error('Runtime Host assistant delta has a gap');
+  const startOffset = delta.startOffset ?? current.length;
+  const overlap = delta.text.slice(0, delta.text.length - folded.tail.length);
+  if (current.slice(startOffset, startOffset + overlap.length) !== overlap) {
     throw new Error('Runtime Host assistant delta conflicts with prior output');
   }
-  const tail = delta.text.slice(overlapLength);
-  return { text: current + tail, tail };
+  return { text: current + folded.tail, tail: folded.tail };
 }
 
 function newlyPendingInteractions(
@@ -703,23 +717,6 @@ function queueChanged(
   next: SessionMessageQueueProjection,
 ): boolean {
   return previous.hostEpoch !== next.hostEpoch || previous.queueRevision !== next.queueRevision;
-}
-
-function newlyInFlight(
-  previous: SessionMessageQueueProjection,
-  next: SessionMessageQueueProjection,
-): Extract<SteeringMessageSnapshot, { state: 'in_flight' }>[] {
-  const previousIds = new Set(rootQueueInFlight(previous).map((entry) => entry.entryId));
-  return rootQueueInFlight(next).filter((entry) => !previousIds.has(entry.entryId));
-}
-
-function rootQueueInFlight(
-  queue: SessionMessageQueueProjection,
-): Extract<SteeringMessageSnapshot, { state: 'in_flight' }>[] {
-  return queue.steering.filter(
-    (entry): entry is Extract<SteeringMessageSnapshot, { state: 'in_flight' }> =>
-      entry.state === 'in_flight',
-  );
 }
 
 function queueHasEntries(queue: SessionMessageQueueProjection): boolean {
@@ -760,7 +757,9 @@ function accumulatorKey(kind: 'text' | 'thinking', messageId: string): string {
   return `${kind}\0${messageId}`;
 }
 
-function frameIdentity(frame: SubscriptionFrame): string {
+function frameIdentity(
+  frame: Exclude<SubscriptionFrame, { kind: 'subscription.runtime_resource_pty_data' }>,
+): string {
   return `host-frame:${frame.hostEpoch}:${frame.subscriptionId}:${frame.sequence}`;
 }
 

@@ -17,19 +17,26 @@
  * under the License.
  */
 
+export * from './prompt-suggestion.js';
 export * from './artifact-preview-registry.js';
+export * from './progress-card.js';
 export * from './assistant-stream.js';
+export * from './client-plugin-slots.js';
+export * from './client-plugin-runtime.js';
 export * from './chat-empty-hero.js';
 export * from './chat-model-helpers.js';
 export * from './use-mounted-ref.js';
+export * from './session-setting-intent.js';
 export * from './components.js';
 export type { ComposerProps } from './components.js';
 export type { SandboxBoundaryPromptProps } from './sandbox-boundary-prompt.js';
+export type { ClientCapabilityPromptProps } from './client-capability-prompt.js';
 export type {
   ProjectRowActions,
   SessionHistoryGroup,
   SessionRowActions,
 } from './session-history-list.js';
+export type { SessionMoveTarget } from './session-rail-context.js';
 export * from './session-status-presentation.js';
 export * from './composer-helpers.js';
 export * from './conversation-copy.js';
@@ -42,6 +49,7 @@ export * from './tool-activity/sandbox-denial.js';
 export * from './chat-input-behavior.js';
 export * from './runtime-resume-copy.js';
 export * from './input-history.js';
+export * from './listed-selection.js';
 export * from './daily-review-helpers.js';
 export * from './locale-helpers.js';
 export * from './locale-context.js';
@@ -49,19 +57,25 @@ export { MakaUriContext } from './markdown.js';
 export * from './maka-uri.js';
 export * from './materialize.js';
 export * from './live-turn-projection.js';
+export * from './live-turn-buffer.js';
 export * from './transcript-projection.js';
 export * from './use-transcript-projection.js';
 export * from './model-picker.js';
+export * from './model-wheel-picker.js';
+export * from './new-project-dialog.js';
 export * from './interaction-queue.js';
 export * from './user-question-prompt.js';
 export * from './user-question-prompt-state.js';
+export * from './form-interaction-prompt.js';
+export * from './form-interaction-prompt-state.js';
 export * from './redact.js';
 export * from './thinking-stream.js';
-export * from './task-ledger-panel.js';
 export * from './toast.js';
 export * from './tool-output-stream.js';
 export * from './ui.js';
 export * from './utils.js';
+export * from './platform-shortcut-text.js';
+export * from './transcript-viewport-navigation.js';
 
 // Maka-owned product assets and compositions remain public only where they do
 // not duplicate a published Astryx component authority.
@@ -92,16 +106,10 @@ export * from './primitives/stat-tile.js';
 // slot, implementation swapped behind it. badgeVariants retired with the cva
 // recipe (no consumers).
 export { Badge, type BadgeProps, type BadgeVariant } from '@astryxdesign/core';
-// PageHeader — the shared page-header shell (convergence round 3). One shell
-// for the module hero (as='h2': 技能 / 定时任务) and the settings intros
-// (as='h3': permission / health / about). Wrapper class + per-slot
-// CSS stay at the call site; the primitive converges STRUCTURE only.
-export { PageHeader } from './primitives/page-header.js';
-export type { PageHeaderProps } from './primitives/page-header.js';
 // ModulePage — the ONE shell every module page renders into (Astryx Layout,
 // incident-console archetype). Born in this package for 定时任务 / 每日回顾;
 // exported so the renderer-owned MCP page renders the same surface.
-export { ModulePage, type ModulePageProps } from './primitives/module-page.js';
+export { ModulePage, type ModulePageDetail, type ModulePageProps } from './primitives/module-page.js';
 // One vocabulary for what a state MEANS, and one place deciding what each
 // word looks like — see status-vocabulary.ts for why there is no `info`.
 export { dotForStatus, type StatusSemantic } from './status-vocabulary.js';
@@ -188,3 +196,7 @@ export {
   type SearchSource,
   type SearchableItem,
 } from '@astryxdesign/core';
+
+export { PromptAnchorRail, type PromptAnchorRailTurn } from './prompt-anchor-rail.js';
+
+export { ChoicePanel, type ChoicePanelOption } from './choice-panel.js';

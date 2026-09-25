@@ -26,14 +26,15 @@ Desktop used a rendered `streaming` prop to decide whether a composer submit sta
 Runtime Host already owns the durable message semantics:
 
 - `current_turn` queues steering for the next provider boundary.
-- `next_turn` queues a successor turn.
+- `next_turn` queues one successor turn per accepted message.
 - queue projections are authoritative.
 - queue projections carry the canonical queued message content; mutation results return only queue state.
 
 ## Desktop Behavior
 
 - While a turn is active, a composer submit queues a follow-up. There is no mode switch: Send is always Send.
-- `Shift+Enter` steers the draft into the active turn once.
+- `Cmd+Enter` on macOS (`Ctrl+Enter` on Windows/Linux) steers the draft into the active turn once; while idle it sends normally.
+- `Shift+Enter` and `Alt+Enter` always insert a line break, including during an active turn.
 - Queued messages render in a pending plate above the composer card, in send order (first at the top). Per entry the plate offers:
   - drag the hover grip to reorder the follow-up queue,
   - promote (立即发送) to steer the entry into the active turn,

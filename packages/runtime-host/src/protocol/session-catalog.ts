@@ -17,13 +17,15 @@
  * under the License.
  */
 
+import { isExecutorConfiguration, type ExecutorConfiguration } from '@maka/core/executor-catalog';
 import { isCollaborationMode, type CollaborationMode } from '@maka/core/collaboration';
 import { isOrchestrationMode, type OrchestrationMode } from '@maka/core/orchestration';
 import { isPermissionMode, type PermissionMode } from '@maka/core/permission';
-import { isSessionStartMode, type SessionStartMode } from '@maka/core/deep-research';
+import { isSessionStartMode, type SessionStartMode } from '@maka/core/session-start-mode';
 import {
   isSessionBlockedReason,
   isSessionToolProfile,
+  SESSION_MODEL_ID_MAX_BYTES,
   type PersistedBackendKind,
   type SessionBlockedReason,
   type SessionStatus,
@@ -31,6 +33,7 @@ import {
   type SessionToolProfile,
 } from '@maka/core/session';
 import { isThinkingLevel, type ThinkingLevel } from '@maka/core/model-thinking';
+import { isExecutorId } from '@maka/core/executor-id';
 import type { ExecutionBoundarySummary } from '@maka/core/sandbox-boundary';
 export type { ExecutionBoundarySummary } from '@maka/core/sandbox-boundary';
 import {
@@ -64,7 +67,7 @@ export const SESSION_CATALOG_NAME_MAX_BYTES = 320;
 export const SESSION_CATALOG_LABEL_MAX_ITEMS = 32;
 export const SESSION_CATALOG_LABEL_MAX_BYTES = 128;
 export const SESSION_CATALOG_PREVIEW_MAX_BYTES = 4 * 1024;
-export const SESSION_CATALOG_MODEL_MAX_BYTES = 512;
+export const SESSION_CATALOG_MODEL_MAX_BYTES = SESSION_MODEL_ID_MAX_BYTES;
 export const SESSION_CATALOG_CONNECTION_SLUG_MAX_BYTES = 256;
 export const SESSION_CATALOG_LIVE_RUN_STATE_SCHEMA_VERSION = 1 as const;
 export const SESSION_CATALOG_RUNNING_TURN_MAX_ITEMS = 64;
@@ -123,6 +126,8 @@ const PROJECTION_FIELDS = [
   'revisionOfTurnId',
   'revisionIndex',
   'revisionState',
+  'executorId',
+  'executorConfig',
   'thinkingLevel',
   'lastReadMessageId',
   'liveRunState',
@@ -148,14 +153,26 @@ export type SessionModelTarget =
       readonly model: string;
     };
 
+export interface SessionExecutorTarget {
+  readonly executorId: string;
+  readonly model?: string;
+}
+
 export interface SessionCreateInput {
   readonly sessionId: string;
   readonly workspace: WorkspaceTarget;
   readonly mode?: SessionStartMode;
   readonly name?: string;
   readonly labels?: readonly string[];
-  readonly modelTarget: SessionModelTarget;
-  readonly thinkingLevel?: ThinkingLevel;
+  /** Required for native execution and omitted for a plugin executor. */
+  readonly modelTarget?: SessionModelTarget;
+  /** Named black-box executor contributed by a Host plugin. */
+  readonly executorId?: string;
+  /** Optional executor-specific model. Only valid with executorId. */
+  readonly executorModel?: string;
+  readonly executorConfig?: ExecutorConfiguration;
+  /** Omitted applies the model preference; null explicitly uses the provider default. */
+  readonly thinkingLevel?: ThinkingLevel | null;
   readonly toolProfile?: SessionToolProfile;
   readonly permissionMode?: PermissionMode;
   readonly collaborationMode?: CollaborationMode;
@@ -175,7 +192,9 @@ export interface SessionMetadataUpdateInput {
 }
 
 export interface SessionConfigurationPatch {
+  readonly executorConfig?: ExecutorConfiguration;
   readonly modelTarget?: Extract<SessionModelTarget, { readonly kind: 'explicit' }>;
+  readonly executorTarget?: SessionExecutorTarget;
   readonly thinkingLevel?: ThinkingLevel | null;
   readonly permissionMode?: PermissionMode;
   readonly collaborationMode?: CollaborationMode;
@@ -236,6 +255,8 @@ export interface SessionCatalogProjection {
   readonly revisionIndex?: number;
   readonly revisionState?: 'preparing' | 'committed';
   readonly backend: PersistedBackendKind;
+  readonly executorId?: string;
+  readonly executorConfig?: ExecutorConfiguration;
   readonly llmConnectionId: string | null;
   readonly llmConnectionSlug: string;
   readonly connectionLocked: boolean;
@@ -253,7 +274,28 @@ export interface UnsupportedLegacySessionCatalogRecord {
   readonly reason: 'not_wire_representable';
 }
 
+export interface SharedSessionCatalogProjection {
+  readonly kind: 'shared_session';
+  readonly id: string;
+  readonly revision: number;
+  readonly createdAt: number;
+  readonly activityAt: number;
+  readonly name: string;
+  readonly lastMessageAt?: number;
+  readonly lastMessagePreview?: string;
+  readonly status: SessionStatus;
+  readonly liveRunState?: SessionCatalogLiveRunState;
+  readonly blockedReason?: SessionBlockedReason;
+  readonly statusUpdatedAt?: number;
+}
+
 export type SessionCatalogItem = SessionCatalogProjection | UnsupportedLegacySessionCatalogRecord;
+
+export type SharedSessionCatalogQueryInput = Record<string, never>;
+
+export interface SharedSessionCatalogQueryResult {
+  readonly session: SharedSessionCatalogProjection | null;
+}
 
 export type SessionCatalogQueryResult =
   | {
@@ -281,6 +323,17 @@ export type SessionUpdateResult =
     };
 
 export const SESSION_CATALOG_OPERATION_SPECS = {
+  'session.shared.query': defineOperation<
+    SharedSessionCatalogQueryInput,
+    SharedSessionCatalogQueryResult,
+    (typeof QUERY_ERRORS)[number]
+  >({
+    mode: 'query',
+    availability: 'ready',
+    errors: QUERY_ERRORS,
+    decodeInput: decodeSharedSessionCatalogQueryInput,
+    decodeOutput: decodeSharedSessionCatalogQueryResult,
+  }),
   'session.catalog.query': defineOperation<
     SessionCatalogQueryInput,
     SessionCatalogQueryResult,
@@ -371,6 +424,49 @@ export const SESSION_CATALOG_OPERATION_SPECS = {
   }),
 } as const;
 
+function decodeSharedSessionCatalogQueryInput(value: unknown): SharedSessionCatalogQueryInput {
+  requireExactRecord(value, 'shared Session catalog query input', []);
+  return {};
+}
+
+function decodeSharedSessionCatalogQueryResult(value: unknown): SharedSessionCatalogQueryResult {
+  const record = requireExactRecord(value, 'shared Session catalog query result', ['session']);
+  const session =
+    record.session === null ? null : decodeSharedSessionCatalogProjection(record.session);
+  requireEncodedByteLimit(
+    session,
+    'shared Session catalog result',
+    SESSION_CATALOG_RESULT_MAX_BYTES,
+  );
+  return { session };
+}
+
+export function decodeSharedSessionCatalogProjection(
+  value: unknown,
+): SharedSessionCatalogProjection {
+  const exact = requireShapedRecord(
+    value,
+    'shared Session catalog projection',
+    ['kind', 'id', 'revision', 'createdAt', 'activityAt', 'name', 'status'],
+    ['lastMessageAt', 'lastMessagePreview', 'liveRunState', 'blockedReason', 'statusUpdatedAt'],
+  );
+  if (exact.kind !== 'shared_session') throw invalidProtocolFrame('Invalid shared Session kind');
+  return {
+    kind: 'shared_session',
+    id: requireEntityId(exact.id, 'Session id'),
+    revision: positiveRevision(exact.revision, 'Session revision'),
+    createdAt: timestamp(exact.createdAt, 'Session createdAt'),
+    activityAt: timestamp(exact.activityAt, 'Session activityAt'),
+    name: sessionName(exact.name),
+    ...optionalTimestamp(exact, 'lastMessageAt'),
+    ...optionalText(exact, 'lastMessagePreview', SESSION_CATALOG_PREVIEW_MAX_BYTES),
+    status: decodeSessionStatus(exact.status),
+    ...optionalLiveRunState(exact),
+    ...optionalBlockedReason(exact),
+    ...optionalTimestamp(exact, 'statusUpdatedAt'),
+  };
+}
+
 export function decodeSessionExecutionBoundaryQueryInput(
   value: unknown,
 ): SessionExecutionBoundaryQueryInput {
@@ -438,11 +534,15 @@ export function decodeSessionCreateInput(value: unknown): SessionCreateInput {
   const input = requireShapedRecord(
     value,
     'Session create input',
-    ['sessionId', 'workspace', 'modelTarget'],
+    ['sessionId', 'workspace'],
     [
       'mode',
       'name',
       'labels',
+      'modelTarget',
+      'executorId',
+      'executorModel',
+      'executorConfig',
       'thinkingLevel',
       'toolProfile',
       'permissionMode',
@@ -450,15 +550,50 @@ export function decodeSessionCreateInput(value: unknown): SessionCreateInput {
       'orchestrationMode',
     ],
   );
+  const executorId = Object.hasOwn(input, 'executorId')
+    ? executorIdValue(input.executorId)
+    : undefined;
+  if (
+    input.executorConfig !== undefined &&
+    (!executorId || !isExecutorConfiguration(input.executorConfig))
+  )
+    throw invalidProtocolFrame('Invalid executor configuration');
+  const target = Object.hasOwn(input, 'modelTarget') ? modelTarget(input.modelTarget) : undefined;
+  const executorModel = Object.hasOwn(input, 'executorModel')
+    ? requireUtf8String(input.executorModel, 'Executor model', SESSION_CATALOG_MODEL_MAX_BYTES)
+    : undefined;
+  if ((executorId === undefined) === (target === undefined)) {
+    throw invalidProtocolFrame('Session creation requires exactly one model target or executor id');
+  }
+  if (
+    executorModel !== undefined &&
+    (input.executorConfig as ExecutorConfiguration | undefined)?.model !== undefined &&
+    executorModel !== (input.executorConfig as ExecutorConfiguration).model
+  ) {
+    throw invalidProtocolFrame('Conflicting executor models');
+  }
+  if (executorModel !== undefined && executorId === undefined) {
+    throw invalidProtocolFrame('Executor model requires an executor id');
+  }
   return {
     sessionId: requireEntityId(input.sessionId, 'sessionId'),
     workspace: decodeWorkspaceTarget(input.workspace),
     ...(Object.hasOwn(input, 'mode') ? { mode: sessionStartMode(input.mode) } : {}),
     ...(Object.hasOwn(input, 'name') ? { name: sessionName(input.name) } : {}),
     ...(Object.hasOwn(input, 'labels') ? { labels: labels(input.labels) } : {}),
-    modelTarget: modelTarget(input.modelTarget),
+    ...(target ? { modelTarget: target } : {}),
+    ...(executorId ? { executorId } : {}),
+    ...(executorModel ? { executorModel } : {}),
+    ...(executorId
+      ? {
+          executorId,
+          ...(input.executorConfig
+            ? { executorConfig: input.executorConfig as ExecutorConfiguration }
+            : {}),
+        }
+      : {}),
     ...(Object.hasOwn(input, 'thinkingLevel')
-      ? { thinkingLevel: thinkingLevel(input.thinkingLevel) }
+      ? { thinkingLevel: input.thinkingLevel === null ? null : thinkingLevel(input.thinkingLevel) }
       : {}),
     ...(Object.hasOwn(input, 'toolProfile')
       ? { toolProfile: sessionToolProfile(input.toolProfile) }
@@ -525,17 +660,41 @@ export function decodeSessionConfigurationUpdateInput(
     input.patch,
     'Session configuration patch',
     [],
-    ['modelTarget', 'thinkingLevel', 'permissionMode', 'collaborationMode', 'orchestrationMode'],
+    [
+      'executorConfig',
+      'modelTarget',
+      'executorTarget',
+      'thinkingLevel',
+      'permissionMode',
+      'collaborationMode',
+      'orchestrationMode',
+    ],
   );
+  if (
+    patch.executorConfig !== undefined &&
+    (!isExecutorConfiguration(patch.executorConfig) ||
+      patch.modelTarget !== undefined ||
+      patch.executorTarget !== undefined)
+  )
+    throw invalidProtocolFrame('Invalid executor configuration');
   if (Object.keys(patch).length === 0) {
     throw invalidProtocolFrame('Session configuration patch is empty');
+  }
+  if (Object.hasOwn(patch, 'modelTarget') && Object.hasOwn(patch, 'executorTarget')) {
+    throw invalidProtocolFrame('Session configuration cannot select two execution targets');
   }
   return {
     sessionId: requireEntityId(input.sessionId, 'sessionId'),
     expectedRevision: positiveRevision(input.expectedRevision, 'expected Session revision'),
     patch: {
+      ...(patch.executorConfig
+        ? { executorConfig: patch.executorConfig as ExecutorConfiguration }
+        : {}),
       ...(Object.hasOwn(patch, 'modelTarget')
         ? { modelTarget: explicitModelTarget(patch.modelTarget) }
+        : {}),
+      ...(Object.hasOwn(patch, 'executorTarget')
+        ? { executorTarget: executorTarget(patch.executorTarget) }
         : {}),
       ...(Object.hasOwn(patch, 'thinkingLevel')
         ? {
@@ -685,6 +844,7 @@ export function decodeSessionCatalogProjection(value: unknown): SessionCatalogPr
     ...optionalRevisionIndex(record),
     ...optionalRevisionState(record),
     backend: backend(record.backend),
+    ...optionalExecutorId(record),
     llmConnectionId:
       record.llmConnectionId === null
         ? null
@@ -701,6 +861,9 @@ export function decodeSessionCatalogProjection(value: unknown): SessionCatalogPr
     collaborationMode: collaborationMode(record.collaborationMode),
     orchestrationMode: orchestrationMode(record.orchestrationMode),
   };
+  if ((projection.backend === 'plugin-executor') !== (projection.executorId !== undefined)) {
+    throw invalidProtocolFrame('Session executor identity does not match its backend');
+  }
   requireEncodedByteLimit(
     projection,
     'Session catalog projection',
@@ -922,10 +1085,48 @@ function optionalThinkingLevel(
 // header's durable backend, and rows written by builds that shipped
 // FakeBackend still hold it (#3211).
 function backend(value: unknown): SessionCatalogProjection['backend'] {
-  if (value !== 'ai-sdk' && value !== 'fake') {
+  if (value !== 'ai-sdk' && value !== 'plugin-executor' && value !== 'fake') {
     throw invalidProtocolFrame('Invalid Session backend');
   }
   return value;
+}
+
+function executorIdValue(value: unknown): string {
+  const id = requireUtf8String(value, 'Executor id', 128);
+  if (!isExecutorId(id)) {
+    throw invalidProtocolFrame('Invalid Executor id');
+  }
+  return id;
+}
+
+function executorTarget(value: unknown): SessionExecutorTarget {
+  const exact = requireShapedRecord(value, 'Session executor target', ['executorId'], ['model']);
+  return {
+    executorId: executorIdValue(exact.executorId),
+    ...(Object.hasOwn(exact, 'model')
+      ? {
+          model: requireUtf8String(exact.model, 'Executor model', SESSION_CATALOG_MODEL_MAX_BYTES),
+        }
+      : {}),
+  };
+}
+
+function optionalExecutorId(
+  record: Record<string, unknown>,
+): Pick<SessionCatalogProjection, 'executorId' | 'executorConfig'> | Record<string, never> {
+  if (record.executorId === undefined) {
+    if (record.executorConfig !== undefined)
+      throw invalidProtocolFrame('Executor configuration requires an executor');
+    return {};
+  }
+  if (record.executorConfig !== undefined && !isExecutorConfiguration(record.executorConfig))
+    throw invalidProtocolFrame('Invalid executor configuration');
+  return {
+    executorId: executorIdValue(record.executorId),
+    ...(record.executorConfig
+      ? { executorConfig: record.executorConfig as ExecutorConfiguration }
+      : {}),
+  };
 }
 
 function thinkingLevel(value: unknown): ThinkingLevel {

@@ -20,9 +20,9 @@
 import { MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_COUNT } from '@maka/core/attachments';
 import {
   decodeMessageContent as decodeCanonicalMessageContent,
-  isContextBudgetExhaustedDetail,
+  DIRECTORY_REFERENCE_MAX_COUNT,
+  hasMeaningfulMessageContent,
   isCanonicalAttachmentRef,
-  type ContextBudgetExhaustedDetail,
   type ContextCompactionOutcome,
   type MessageContent,
   type ProviderRetryReason,
@@ -93,12 +93,6 @@ export interface TurnStopInput {
   sessionId: string;
   turnId: string;
   runId: string;
-}
-
-export interface TurnRegenerateInput {
-  sessionId: string;
-  sourceTurnId: string;
-  turnId: string;
 }
 
 export interface TurnResumeQueryInput {
@@ -189,6 +183,14 @@ export type TurnProviderRetry =
 export type LiveTurnSnapshot = TurnSnapshotBase & {
   status: Exclude<TurnRunStatus, 'completed' | 'failed' | 'cancelled'>;
   providerRetry?: TurnProviderRetry;
+  /**
+   * Set when this live Turn is a host-owned explicit context-compaction run, so
+   * the renderer can show a "compacting" transcript row while it is in flight.
+   * Sourced from `AgentRunHeader.rootExecutionKind`; a `context_compact` Turn
+   * emits no assistant text, and this survives a Desktop reconnect because the
+   * Host re-projects the live snapshot.
+   */
+  rootExecutionKind?: 'context_compact';
 };
 
 export type TurnSnapshot =
@@ -203,7 +205,6 @@ export type TurnSnapshot =
       terminalEventId: string;
       failureClass: string;
       failureMessage?: string;
-      contextBudgetExhaustedDetail?: ContextBudgetExhaustedDetail;
     })
   | (TurnSnapshotBase & {
       status: 'cancelled';
@@ -262,27 +263,6 @@ export const TURN_OPERATION_SPECS = {
     ] as const,
     decodeInput: decodeTurnStopInput,
     decodeOutput: decodeTurnSnapshot,
-  }),
-  'turn.regenerate': defineOperation({
-    mode: 'command',
-    availability: 'ready',
-    errors: [
-      'host_not_ready',
-      'host_draining',
-      'operation_unavailable',
-      'not_found',
-      'session_archived',
-      'session_busy',
-      'operation_conflict',
-      'internal_failure',
-    ] as const,
-    decodeInput: decodeTurnRegenerateInput,
-    decodeOutput: decodeTurnSnapshot,
-    assertOutputForInput: (input, output) => {
-      if (input.sessionId !== output.sessionId || input.turnId !== output.turnId) {
-        throw invalidProtocolFrame('Turn regenerate changed operation identity');
-      }
-    },
   }),
   'turn.resume.query': defineOperation({
     mode: 'query',
@@ -344,7 +324,7 @@ export const TURN_OPERATION_SPECS = {
   }),
 } as const;
 
-function decodeTurnStartInput(value: unknown): TurnStartInput {
+export function decodeTurnStartInput(value: unknown): TurnStartInput {
   const record = requireShapedRecord(
     value,
     'turn.start input',
@@ -414,6 +394,9 @@ export function decodeMessageContent(value: unknown, allowEmptyText = false): Me
       true,
     );
   }
+  if ((content.directoryReferences?.length ?? 0) > DIRECTORY_REFERENCE_MAX_COUNT) {
+    throw invalidProtocolFrame('Too many directory references');
+  }
   if ((content.attachments?.length ?? 0) > MAX_ATTACHMENT_COUNT) {
     throw invalidProtocolFrame('Invalid Message attachments');
   }
@@ -463,7 +446,15 @@ export function decodeMessageAdmissionContent(
   value: unknown,
   allowEmptyText = false,
 ): MessageContent {
-  const content = decodeMessageContent(value, allowEmptyText);
+  // Structure first with text emptiness unconstrained, then apply the
+  // shared meaningful-content predicate: a quote or an attachment carries
+  // the turn by itself, so empty inline text is admissible when either is
+  // present (#4804). A truly contentless Message still throws, with the
+  // same frame error the text-length rule produced.
+  const content = decodeMessageContent(value, true);
+  if (!allowEmptyText && !hasMeaningfulMessageContent(content)) {
+    throw invalidProtocolFrame('Invalid Message text');
+  }
   if (content.attachments?.some((attachment) => attachment.ref.kind === 'session_context')) {
     throw invalidProtocolFrame('Session context references are Host-owned');
   }
@@ -512,19 +503,6 @@ function decodeTurnStopInput(value: unknown): TurnStopInput {
     sessionId: requireEntityId(record.sessionId, 'sessionId'),
     turnId: requireEntityId(record.turnId, 'turnId'),
     runId: requireEntityId(record.runId, 'runId'),
-  };
-}
-
-function decodeTurnRegenerateInput(value: unknown): TurnRegenerateInput {
-  const record = requireExactRecord(value, 'turn.regenerate input', [
-    'sessionId',
-    'sourceTurnId',
-    'turnId',
-  ]);
-  return {
-    sessionId: requireEntityId(record.sessionId, 'sessionId'),
-    sourceTurnId: requireEntityId(record.sourceTurnId, 'sourceTurnId'),
-    turnId: requireEntityId(record.turnId, 'turnId'),
   };
 }
 
@@ -652,6 +630,13 @@ function requirePositiveCount(value: unknown, label: string): number {
   return count;
 }
 
+function requireContextCompactRootExecutionKind(value: unknown): 'context_compact' {
+  if (value !== 'context_compact') {
+    throw invalidProtocolFrame('Invalid Turn rootExecutionKind');
+  }
+  return value;
+}
+
 export function decodeTurnSnapshot(value: unknown): TurnSnapshot {
   const record = requireRecord(value, 'Turn snapshot');
   const base = {
@@ -685,7 +670,7 @@ export function decodeTurnSnapshot(value: unknown): TurnSnapshot {
       record,
       'failed Turn snapshot',
       ['sessionId', 'turnId', 'runId', 'status', 'terminalEventId', 'failureClass'],
-      ['failureMessage', 'contextBudgetExhaustedDetail'],
+      ['failureMessage'],
     );
     return {
       ...base,
@@ -699,13 +684,6 @@ export function decodeTurnSnapshot(value: unknown): TurnSnapshot {
               'failureMessage',
               TURN_FAILURE_MESSAGE_MAX_BYTES,
               false,
-            ),
-          }
-        : {}),
-      ...(record.contextBudgetExhaustedDetail !== undefined
-        ? {
-            contextBudgetExhaustedDetail: requireContextBudgetExhaustedDetail(
-              record.contextBudgetExhaustedDetail,
             ),
           }
         : {}),
@@ -731,7 +709,7 @@ export function decodeTurnSnapshot(value: unknown): TurnSnapshot {
     record,
     'non-terminal Turn snapshot',
     ['sessionId', 'turnId', 'runId', 'status'],
-    ['providerRetry'],
+    ['providerRetry', 'rootExecutionKind'],
   );
   return {
     ...base,
@@ -739,12 +717,10 @@ export function decodeTurnSnapshot(value: unknown): TurnSnapshot {
     ...(record.providerRetry !== undefined
       ? { providerRetry: decodeTurnProviderRetry(record.providerRetry) }
       : {}),
+    ...(record.rootExecutionKind !== undefined
+      ? { rootExecutionKind: requireContextCompactRootExecutionKind(record.rootExecutionKind) }
+      : {}),
   };
-}
-
-function requireContextBudgetExhaustedDetail(value: unknown): ContextBudgetExhaustedDetail {
-  if (isContextBudgetExhaustedDetail(value)) return value;
-  throw invalidProtocolFrame('Invalid context budget exhausted detail');
 }
 
 export function decodeContextCompactionOutcome(value: unknown): ContextCompactionOutcome {
@@ -801,6 +777,7 @@ function requireProviderRetryReason(value: unknown): ProviderRetryReason {
     value === 'network' ||
     value === 'provider_capacity' ||
     value === 'provider_unavailable' ||
+    value === 'stream_truncated' ||
     value === 'rate_limit' ||
     value === 'timeout' ||
     value === 'unknown'

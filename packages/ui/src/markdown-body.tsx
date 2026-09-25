@@ -29,7 +29,7 @@
  * product-specific trust boundaries around that renderer.
  */
 
-import { useContext, type ReactNode } from 'react';
+import { useCallback, useContext, useRef, type ReactNode } from 'react';
 import {
   Markdown as AstryxMarkdown,
   type MarkdownComponents,
@@ -46,13 +46,18 @@ import { MakaUriContext } from './markdown.js';
 import { useUiLocale } from './locale-context.js';
 import { getSharedUiCopy } from './shared-ui-copy.js';
 import { MermaidDiagram } from './mermaid-diagram.js';
-import { prepareMarkdownMath } from './markdown-math.js';
+import {
+  createMarkdownMathCache,
+  MarkdownMath,
+  prepareMarkdownMath,
+} from './markdown-math.js';
 import { parseAttachmentResourceRef } from '@maka/core/attachments';
 import { useAttachmentImageSource } from './attachment-image.js';
 
 const BASE_MARKDOWN_COMPONENTS = {
   link: MarkdownLink,
   image: MarkdownImage,
+  math: MarkdownMath,
 };
 
 export const MAX_AUTOMATIC_MERMAID_DIAGRAMS = 3;
@@ -107,6 +112,17 @@ export function applyMermaidRenderBudget(source: string): string {
   return lines.join('\n');
 }
 
+// Whether the prose (not code) of a markdown source is written in Han script.
+// The document `lang` is the UI locale, which says nothing about what the
+// model wrote, so the CSS that styles Han-specific runs (emphasis has no
+// italic in Han faces) keys on this instead.
+export function hasHanProse(source: string): boolean {
+  const prose = source
+    .replace(/^( {0,3})(`{3,}|~{3,})[^\n]*\n[\s\S]*?\n {0,3}\2[ \t]*$/gm, '')
+    .replace(/`[^`\n]*`/g, '');
+  return /\p{Script=Han}/u.test(prose);
+}
+
 const MARKDOWN_COMPONENTS = {
   default: {
     ...BASE_MARKDOWN_COMPONENTS,
@@ -132,9 +148,12 @@ export function MarkdownBody(props: {
   settledText?: string;
   density?: 'default' | 'compact';
 }) {
-  const prepared = prepareMarkdownMath(props.text, props.settledText);
-  const safeText = prepared.text;
-  const budgetedText = props.streaming ? safeText : applyMermaidRenderBudget(safeText);
+  const mathCache = useRef(createMarkdownMathCache());
+  const transformMathSource = useCallback(
+    (source: string) => prepareMarkdownMath(source, mathCache.current),
+    [],
+  );
+  const budgetedText = props.streaming ? props.text : applyMermaidRenderBudget(props.text);
   const density = props.density ?? 'default';
   const components = props.streaming
     ? density === 'compact'
@@ -145,6 +164,7 @@ export function MarkdownBody(props: {
   return (
     <div
       data-maka-contract="markdown"
+      data-maka-script={hasHanProse(props.text) ? 'han' : undefined}
       // Migration-only identity wrapper. `display: contents` gives the
       // contract harness a stable declared subtree without adding a layout
       // box or interfering with Astryx's document root.
@@ -175,9 +195,9 @@ export function MarkdownBody(props: {
         // the one combination neither half of the argument asks for.
         density={density}
         components={components}
-        inlinePlugins={[prepared.plugin]}
         isStreaming={props.streaming}
-        settledText={prepared.settledText}
+        settledText={props.settledText}
+        transformSource={transformMathSource}
       >
         {budgetedText}
       </AstryxMarkdown>
@@ -232,6 +252,9 @@ function MarkdownCode(props: {
       <CodeBlock
         code={props.code}
         language={props.language}
+        // Span highlighting avoids the higher CSS Highlight paint cost during
+        // transcript scrolling, including when virtualized code blocks remount.
+        highlightMode="spans"
         // Markdown fences are block content. Astryx defaults to fit-content
         // with a 400px floor, which leaves short-code fences visibly narrow
         // even when the surrounding transcript has room to stay readable.

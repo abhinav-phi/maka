@@ -21,6 +21,7 @@ import { createHash } from 'node:crypto';
 import { userInfo } from 'node:os';
 import type { ShellRunSnapshotResult, ShellRunUpdate, ToolResultContent } from '@maka/core/events';
 import { isActiveShellRunStatus } from '@maka/core/shell-run';
+import { shellRunStateProjection } from '@maka/core/shell-run-result';
 import {
   type BackgroundTaskStopper,
   type PtyControlWriter,
@@ -59,13 +60,14 @@ import type {
   ConnectionContext,
   RuntimeResourceOperationHandlerMap,
 } from './operation-dispatcher.js';
+import type { RuntimeHostAccessAuthority } from './access-authority.js';
+import { boundedFailureDiagnostic } from './failure-diagnostic.js';
 import { SessionAdmissionGate } from './session-admission-gate.js';
 import {
-  boundedRuntimeResourceSnapshot,
+  boundedRuntimeResourceState,
   canonicalRuntimeResources,
   createRuntimeResourcePage,
   runtimeResourceRevision,
-  runtimeResourceSnapshotFromResult,
 } from './runtime-resource-projection.js';
 
 const MAX_CONTROL_REPLAYS = 128;
@@ -87,8 +89,8 @@ interface RuntimeResourceManager
     RuntimeResourceReader,
     BackgroundTaskStopper,
     PtyControlWriter {
-  inspectResource(sessionId: string, ref: string): Promise<ShellRunSnapshotResult>;
   getLivePtySnapshot(sessionId: string, ref: string): ShellRunPtySnapshot | null;
+  inspectResource(sessionId: string, ref: string): Promise<ShellRunSnapshotResult>;
   terminateAll(): Promise<void>;
 }
 
@@ -99,6 +101,7 @@ export interface HostRuntimeResourceCoordinatorInput {
   readonly sessionAdmission: SessionAdmissionGate;
   readonly acquireResidency: () => RuntimeHostResidency;
   readonly requestDrain: () => void;
+  readonly sessionAccessAuthority?: Pick<RuntimeHostAccessAuthority, 'activeSessionGrant'>;
   readonly onProjectionChanged?: (update: ShellRunUpdate) => void;
   /**
    * Fallback shell resolution for callers that do not carry a plan (e.g.
@@ -129,7 +132,7 @@ export class HostRuntimeResourceCoordinator
   implements ShellRunLauncher, RuntimeResourceReader, BackgroundTaskStopper, PtyControlWriter
 {
   readonly handlers: RuntimeResourceOperationHandlerMap = {
-    'runtime.resource.query': (input) => this.#query(input),
+    'runtime.resource.query': (input, context) => this.#query(input, context),
     'runtime.resource.start': (input) => this.#start(input),
     'runtime.resource.controller.acquire': (input, context) => this.#acquire(input, context),
     'runtime.resource.controller.control': (input, context) => this.#control(input, context),
@@ -143,6 +146,9 @@ export class HostRuntimeResourceCoordinator
   readonly #sessionAdmission: SessionAdmissionGate;
   readonly #acquireResidency: () => RuntimeHostResidency;
   readonly #requestDrain: () => void;
+  readonly #sessionAccessAuthority:
+    | Pick<RuntimeHostAccessAuthority, 'activeSessionGrant'>
+    | undefined;
   readonly #onProjectionChanged: (update: ShellRunUpdate) => void;
   readonly #resolveShell: () => Promise<ShellPlan> | ShellPlan;
   readonly #resourceQueue = new ResourceSerialQueue();
@@ -159,6 +165,7 @@ export class HostRuntimeResourceCoordinator
     this.#sessionAdmission = input.sessionAdmission;
     this.#acquireResidency = input.acquireResidency;
     this.#requestDrain = input.requestDrain;
+    this.#sessionAccessAuthority = input.sessionAccessAuthority;
     this.#onProjectionChanged = input.onProjectionChanged ?? (() => undefined);
     this.#resolveShell = input.resolveShell ?? defaultShellPlan;
   }
@@ -285,73 +292,108 @@ export class HostRuntimeResourceCoordinator
     return updates.some((update) => isActiveShellRunStatus(update.result.status));
   }
 
-  #query(input: RuntimeResourceQueryInput): Promise<OperationOutcome<'runtime.resource.query'>> {
+  async #query(
+    input: RuntimeResourceQueryInput,
+    context: ConnectionContext,
+  ): Promise<OperationOutcome<'runtime.resource.query'>> {
     if (input.kind === 'get' && !isShellRunResourceRef(input.ref)) {
-      return Promise.resolve(
-        queryFailure('invalid_request', 'Runtime Resource ref is unsupported'),
-      );
+      return queryFailure('invalid_request', 'Runtime Resource ref is unsupported');
     }
-    return this.#sessionAdmission.run(input.sessionId, async () => {
-      try {
-        await this.#sessionHeaders.readHeader(input.sessionId);
-      } catch (error) {
-        if (isSessionNotFoundError(error)) {
-          return queryFailure('not_found', 'Session was not found');
-        }
-        this.#requestDrain();
-        return queryFailure('internal_failure', 'Session state is unavailable');
-      }
-      if (input.kind === 'get') {
+    const guestGrantId = this.#guestObservationGrantId(context, input.sessionId);
+    if (context.principalKind === 'session_guest' && !guestGrantId) {
+      return queryFailure('not_found', 'Session was not found');
+    }
+    const outcome: OperationOutcome<'runtime.resource.query'> = await this.#sessionAdmission.run(
+      input.sessionId,
+      async () => {
         try {
-          const resource = await this.#sessions.getShellRunUpdate(input.sessionId, input.ref);
-          const canonical = resource ? (canonicalRuntimeResources([resource])[0] ?? null) : null;
+          await this.#sessionHeaders.readHeader(input.sessionId);
+        } catch (error) {
+          if (isSessionNotFoundError(error)) {
+            return queryFailure('not_found', 'Session was not found');
+          }
+          return this.#canonicalReadFailure(error, 'Session state is unavailable');
+        }
+        if (input.kind === 'get') {
+          try {
+            const resource = await this.#sessions.getShellRunUpdate(input.sessionId, input.ref);
+            const visible =
+              context.principalKind !== 'session_guest' || resource?.sessionId === input.sessionId
+                ? resource
+                : null;
+            const canonical = visible ? (canonicalRuntimeResources([visible])[0] ?? null) : null;
+            return {
+              ok: true,
+              result: decodeRuntimeResourceQueryResult({
+                kind: 'resource',
+                sessionId: input.sessionId,
+                revision: runtimeResourceRevision(canonical ? [canonical] : []),
+                resource: canonical,
+              }),
+            };
+          } catch (error) {
+            return this.#canonicalReadFailure(error, 'Runtime Resource state is unavailable');
+          }
+        }
+        let updates: ShellRunUpdate[];
+        try {
+          updates = await this.#sessions.listShellRunUpdates(input.sessionId);
+          if (context.principalKind === 'session_guest') {
+            updates = updates.filter((update) => update.sessionId === input.sessionId);
+          }
+        } catch (error) {
+          return this.#canonicalReadFailure(error, 'Runtime Resource state is unavailable');
+        }
+        try {
+          const resources = canonicalRuntimeResources(updates);
+          const revision = runtimeResourceRevision(resources);
+          if (input.kind === 'list_continue' && input.revision !== revision) {
+            return {
+              ok: true,
+              result: { kind: 'revision_changed', expected: input.revision, actual: revision },
+            };
+          }
+          const offset = input.kind === 'list_start' ? 0 : decodeCursor(input.cursor);
+          if (
+            offset === undefined ||
+            offset > resources.length ||
+            (input.kind === 'list_continue' && offset === 0) ||
+            (input.kind === 'list_continue' && offset === resources.length)
+          ) {
+            return queryFailure('invalid_request', 'Runtime Resource cursor is invalid');
+          }
           return {
             ok: true,
-            result: decodeRuntimeResourceQueryResult({
-              kind: 'resource',
-              sessionId: input.sessionId,
-              revision: runtimeResourceRevision(canonical ? [canonical] : []),
-              resource: canonical,
-            }),
+            result: createRuntimeResourcePage(input.sessionId, revision, resources, offset),
           };
         } catch {
-          this.#requestDrain();
-          return queryFailure('internal_failure', 'Runtime Resource state is unavailable');
+          return queryFailure('internal_failure', 'Runtime Resource projection is unavailable');
         }
-      }
-      let updates: ShellRunUpdate[];
-      try {
-        updates = await this.#sessions.listShellRunUpdates(input.sessionId);
-      } catch {
-        this.#requestDrain();
-        return queryFailure('internal_failure', 'Runtime Resource state is unavailable');
-      }
-      try {
-        const resources = canonicalRuntimeResources(updates);
-        const revision = runtimeResourceRevision(resources);
-        if (input.kind === 'list_continue' && input.revision !== revision) {
-          return {
-            ok: true,
-            result: { kind: 'revision_changed', expected: input.revision, actual: revision },
-          };
-        }
-        const offset = input.kind === 'list_start' ? 0 : decodeCursor(input.cursor);
-        if (
-          offset === undefined ||
-          offset > resources.length ||
-          (input.kind === 'list_continue' && offset === 0) ||
-          (input.kind === 'list_continue' && offset === resources.length)
-        ) {
-          return queryFailure('invalid_request', 'Runtime Resource cursor is invalid');
-        }
-        return {
-          ok: true,
-          result: createRuntimeResourcePage(input.sessionId, revision, resources, offset),
-        };
-      } catch {
-        return queryFailure('internal_failure', 'Runtime Resource projection is unavailable');
-      }
-    });
+      },
+    );
+    return guestGrantId && this.#guestObservationGrantId(context, input.sessionId) !== guestGrantId
+      ? queryFailure('not_found', 'Session was not found')
+      : outcome;
+  }
+
+  #canonicalReadFailure(
+    error: unknown,
+    message: string,
+  ): OperationOutcome<'runtime.resource.query'> {
+    console.error(
+      `[runtime-host] canonical Runtime Resource read failed: ${boundedFailureDiagnostic(error)}`,
+    );
+    this.#requestDrain();
+    return queryFailure('internal_failure', message);
+  }
+
+  #guestObservationGrantId(context: ConnectionContext, sessionId: string): string | undefined {
+    if (context.principalKind !== 'session_guest') return;
+    return this.#sessionAccessAuthority?.activeSessionGrant(
+      context.principal,
+      sessionId,
+      'session_observation',
+    )?.grantId;
   }
 
   async #start(
@@ -433,16 +475,14 @@ export class HostRuntimeResourceCoordinator
           return {
             ok: true as const,
             result: decodeRuntimeResourceStartResult({
-              resource: boundedRuntimeResourceSnapshot(
-                await this.#manager.inspectResource(input.sessionId, launched.ref),
-              ),
+              resource: boundedRuntimeResourceState(shellRunStateProjection(launched)),
             }),
           };
-        } catch (inspectError) {
+        } catch (replyError) {
           // The command is already live but the operation must not report a
           // success it cannot honor: stop it so a client retry cannot
           // double-execute (#3210 review). Best-effort — the surfaced error
-          // stays the inspection failure.
+          // stays the reply failure.
           try {
             await this.#manager.stopBackgroundTask(
               input.sessionId,
@@ -451,9 +491,9 @@ export class HostRuntimeResourceCoordinator
               'client',
             );
           } catch {
-            /* keep the inspection failure as the surfaced cause */
+            /* keep the reply failure as the surfaced cause */
           }
-          throw inspectError;
+          throw replyError;
         }
       });
     } catch (error) {
@@ -485,8 +525,11 @@ export class HostRuntimeResourceCoordinator
         if (sessionFailure)
           return mutationFailure('runtime.resource.controller.acquire', sessionFailure);
         try {
-          const snapshot = await this.#manager.inspectResource(input.sessionId, input.ref);
-          if (snapshot.mode !== 'pty' || !isActiveShellRunStatus(snapshot.status)) {
+          const pty = this.#manager.getLivePtySnapshot(input.sessionId, input.ref);
+          if (!pty) {
+            // No live handle: read through the manager so a stale active record
+            // is repaired to orphaned; the reply is a conflict either way.
+            await this.#manager.inspectResource(input.sessionId, input.ref);
             return mutationFailure('runtime.resource.controller.acquire', {
               code: 'operation_conflict',
               message: 'Only an active PTY Runtime Resource can be controlled',
@@ -519,14 +562,6 @@ export class HostRuntimeResourceCoordinator
           };
           this.#controllers.set(key, controller);
           this.#controllerResources.set(identity, key);
-          const pty = this.#manager.getLivePtySnapshot(input.sessionId, input.ref);
-          if (!pty) {
-            this.#releaseController(key);
-            return mutationFailure('runtime.resource.controller.acquire', {
-              code: 'operation_conflict',
-              message: 'Runtime Resource PTY is no longer available',
-            });
-          }
           return {
             ok: true,
             result: boundedControllerAcquireResult(
@@ -597,7 +632,6 @@ export class HostRuntimeResourceCoordinator
           const result = decodeRuntimeResourceControllerControlResult({
             controllerId: input.controllerId,
             sequence: input.sequence,
-            resource: boundedRuntimeResourceSnapshot(runtimeResourceSnapshotFromResult(controlled)),
           });
           this.#rememberReplay({
             connectionId: context.connectionId,
@@ -684,12 +718,7 @@ export class HostRuntimeResourceCoordinator
             'client',
           );
           this.#releaseControllerIfTerminal(input.sessionId, input.ref, result);
-          return {
-            ok: true,
-            result: decodeRuntimeResourceStopResult({
-              resource: boundedRuntimeResourceSnapshot(runtimeResourceSnapshotFromResult(result)),
-            }),
-          };
+          return { ok: true, result: decodeRuntimeResourceStopResult({}) };
         } catch (error) {
           return this.#resourceFailure('runtime.resource.stop', error);
         }

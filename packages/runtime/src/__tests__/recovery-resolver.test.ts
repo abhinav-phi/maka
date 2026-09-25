@@ -18,11 +18,15 @@
  */
 
 import assert from 'node:assert/strict';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, it } from 'node:test';
 import { canonicalToolArgsHash } from '@maka/core/tool-args-identity';
 import type { RuntimeEvent } from '@maka/core/runtime-event';
+import { createSqliteRuntimeStore } from '@maka/storage/sqlite-runtime-store';
 import {
-  buildInterruptedCodeModeOutcomeCommits,
+  buildInterruptedToolOutcomeCommits,
   resolveRuntimeRecovery,
 } from '../recovery-resolver.js';
 
@@ -68,7 +72,7 @@ describe('RecoveryResolver', () => {
     assert.equal(resolution.requiresReconciliation, true);
   });
 
-  it('builds an interrupted outcome only for the outer exec operation', () => {
+  it('settles every dispatched operation, including hidden nested calls', () => {
     const outerCall = event({
       id: 'outer-call',
       role: 'model',
@@ -111,38 +115,133 @@ describe('RecoveryResolver', () => {
       parentToolCallId: 'exec-1',
     });
 
-    const commits = buildInterruptedCodeModeOutcomeCommits(
+    const commits = buildInterruptedToolOutcomeCommits(
       [initialEvent('t1_after_preflight_v1'), outerCall, outerDispatch, nestedCall, nestedDispatch],
       50,
       'code_mode',
     );
 
-    assert.equal(commits.length, 1);
-    assert.equal(commits[0]?.operationId, 'outer-op');
-    assert.equal(commits[0]?.runtimeEvent.content?.kind, 'function_response');
+    assert.equal(commits.length, 2);
+    const outerCommit = commits.find((commit) => commit.operationId === 'outer-op');
+    const nestedCommit = commits.find((commit) => commit.operationId === 'nested-op');
+    assert.ok(outerCommit);
+    assert.ok(nestedCommit);
+    assert.equal(outerCommit.runtimeEvent.content?.kind, 'function_response');
     assert.equal(
-      commits[0]?.runtimeEvent.content?.kind === 'function_response'
-        ? commits[0].runtimeEvent.content.isError
+      outerCommit.runtimeEvent.content?.kind === 'function_response'
+        ? outerCommit.runtimeEvent.content.isError
         : false,
       true,
     );
     assert.deepEqual(
-      commits[0]?.runtimeEvent.content?.kind === 'function_response'
-        ? commits[0].runtimeEvent.content.result
+      outerCommit.runtimeEvent.content?.kind === 'function_response'
+        ? outerCommit.runtimeEvent.content.result
         : undefined,
       {
         kind: 'json',
         value: {
           kind: 'code_mode',
           status: 'interrupted',
-          message: 'Code Mode execution was interrupted by runtime recovery.',
+          message:
+            'Code Mode execution was interrupted by runtime recovery. Its side effects may or may not have occurred; do not retry it immediately. Inspect the current state first.',
+          uncertainOutcome: { code: 'outcome_unknown', retrySafe: false },
         },
       },
     );
+    assert.deepEqual(
+      outerCommit.runtimeEvent.content?.kind === 'function_response'
+        ? outerCommit.runtimeEvent.content.modelProjection
+        : undefined,
+      {
+        version: 1,
+        kind: 'json',
+        value: {
+          kind: 'json',
+          value: {
+            kind: 'code_mode',
+            status: 'interrupted',
+            message:
+              'Code Mode execution was interrupted by runtime recovery. Its side effects may or may not have occurred; do not retry it immediately. Inspect the current state first.',
+            uncertainOutcome: { code: 'outcome_unknown', retrySafe: false },
+          },
+        },
+        isError: true,
+      },
+    );
+    assert.equal(nestedCommit.runtimeEvent.modelVisibility, 'hidden');
+    assert.equal(
+      nestedCommit.runtimeEvent.content?.kind === 'function_response'
+        ? nestedCommit.runtimeEvent.content.isError
+        : false,
+      true,
+    );
+    assert.equal(
+      nestedCommit.runtimeEvent.content?.kind === 'function_response' &&
+        typeof nestedCommit.runtimeEvent.content.result === 'object' &&
+        nestedCommit.runtimeEvent.content.result !== null &&
+        'uncertainOutcome' in nestedCommit.runtimeEvent.content.result,
+      true,
+    );
   });
 
-  it('does not infer Code Mode recovery from a custom direct exec name', () => {
-    const commits = buildInterruptedCodeModeOutcomeCommits(
+  it('commits a projected recovery outcome through the projection-aware SQLite T2 gate', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'maka-recovery-projection-'));
+    const store = createSqliteRuntimeStore(join(root, 'runtime.sqlite'));
+    try {
+      const call = event({
+        id: 'outer-call',
+        role: 'model',
+        author: 'agent',
+        origin: 'provider',
+        modelVisibility: 'visible',
+        content: { kind: 'function_call', id: 'exec-1', name: 'exec', args: { code: 'work()' } },
+        refs: { operationId: 'outer-op', toolCallId: 'exec-1' },
+      });
+      const dispatch = dispatchFor({
+        id: 'outer-dispatch',
+        operationId: 'outer-op',
+        toolCallId: 'exec-1',
+        toolName: 'exec',
+        args: { code: 'work()' },
+        resultProjectionVersion: 1,
+      });
+      await store.commitToolPrepared({
+        operationId: 'outer-op',
+        journalEventId: 'outer-op_prepared',
+        runtimeEvent: call,
+        dispatchRuntimeEvent: dispatch,
+        providerToolCallId: 'exec-1',
+        toolName: 'exec',
+        canonicalArgsHash: canonicalToolArgsHash('exec', { code: 'work()' }),
+        recoveryMode: 'never_auto_retry',
+        committedAt: 10,
+      });
+
+      const [commit] = buildInterruptedToolOutcomeCommits(
+        await store.readImmutableRuntimeEvents('session-1', 'run-1'),
+        50,
+        'code_mode',
+      );
+      assert.ok(commit);
+      await store.commitToolOutcome(commit);
+
+      assert.equal((await store.readToolOperation('outer-op'))?.currentState, 'outcome_committed');
+      const response = (await store.readImmutableRuntimeEvents('session-1', 'run-1')).at(-1);
+      assert.equal(response?.content?.kind, 'function_response');
+      assert.equal(
+        response?.content?.kind === 'function_response'
+          ? response.content.modelProjection?.version
+          : undefined,
+        1,
+      );
+    } finally {
+      store.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('marks generic interrupted tools as outcome-unknown and does not retry them', () => {
+    const commits = buildInterruptedToolOutcomeCommits(
       [
         initialEvent('t1_after_preflight_v1'),
         event({
@@ -161,6 +260,68 @@ describe('RecoveryResolver', () => {
           toolName: 'exec',
           args: {},
         }),
+      ],
+      50,
+      'direct',
+    );
+
+    assert.equal(commits.length, 1);
+    assert.equal(commits[0]?.operationId, 'direct-exec-op');
+    assert.equal(
+      commits[0]?.runtimeEvent.content?.kind === 'function_response' &&
+        typeof commits[0].runtimeEvent.content.result === 'object' &&
+        commits[0].runtimeEvent.content.result !== null &&
+        'uncertainOutcome' in commits[0].runtimeEvent.content.result,
+      true,
+    );
+  });
+
+  it('settles a dispatched user question as interrupted without claiming a side effect', () => {
+    const args = { questions: [{ question: 'Continue?', options: ['Yes', 'No'] }] };
+    const call = event({
+      id: 'question-call',
+      role: 'model',
+      author: 'agent',
+      content: {
+        kind: 'function_call',
+        id: 'question-1',
+        name: 'AskUserQuestion',
+        args,
+      },
+    });
+    const dispatch = dispatchFor({
+      id: 'question-dispatch',
+      operationId: 'question-op',
+      toolCallId: 'question-1',
+      toolName: 'AskUserQuestion',
+      args,
+    });
+
+    const [commit] = buildInterruptedToolOutcomeCommits(
+      [initialEvent('t1_after_preflight_v1'), call, dispatch],
+      50,
+      'direct',
+    );
+    assert.ok(commit);
+    assert.equal(commit.runtimeEvent.content?.kind, 'function_response');
+    assert.deepEqual(
+      commit.runtimeEvent.content?.kind === 'function_response'
+        ? commit.runtimeEvent.content.result
+        : undefined,
+      {
+        kind: 'text',
+        text: 'This question was interrupted by runtime recovery before an answer was submitted.',
+      },
+    );
+  });
+
+  it('does not append an interrupted result after the invocation terminal event', () => {
+    const commits = buildInterruptedToolOutcomeCommits(
+      [
+        initialEvent('t1_after_preflight_v1'),
+        functionCallEvent(),
+        toolDispatchEvent(),
+        event({ id: 'terminal-1', status: 'aborted', actions: { endInvocation: true } }),
       ],
       50,
       'direct',
@@ -399,6 +560,7 @@ function dispatchFor(input: {
   modelVisibility?: 'visible' | 'hidden';
   parentOperationId?: string;
   parentToolCallId?: string;
+  resultProjectionVersion?: 1;
 }): RuntimeEvent {
   return event({
     id: input.id,
@@ -412,6 +574,9 @@ function dispatchFor(input: {
         toolName: input.toolName,
         canonicalArgsHash: canonicalToolArgsHash(input.toolName, input.args),
         recoveryMode: 'never_auto_retry',
+        ...(input.resultProjectionVersion !== undefined
+          ? { resultProjectionVersion: input.resultProjectionVersion }
+          : {}),
       },
     },
     refs: {

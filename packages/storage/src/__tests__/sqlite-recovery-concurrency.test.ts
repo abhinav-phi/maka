@@ -27,6 +27,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { describe, it } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import type { RuntimeEvent } from '@maka/core/runtime-event';
+import type { WorkspaceBaselineAuthorityInput } from '@maka/core/workspace-version-authority';
 import { canonicalToolArgsHash } from '@maka/core/tool-args-identity';
 import { scanToolLedger } from '@maka/core/tool-ledger-scanner';
 import {
@@ -37,7 +38,11 @@ import {
   acquireOperationalStateDatabase,
   inspectOperationalStateSchema,
 } from '../operational-state-store.js';
-import { bindWorkspaceBaselineAuthorityStoreRootInternal } from '../workspace-version-authority-internal.js';
+import {
+  bindWorkspaceBaselineAuthorityStoreRootInternal,
+  commitWorkspaceBaselineInternal,
+  readActiveManagedMutationInternal,
+} from '../workspace-version-authority-internal.js';
 
 const WORKER_READY_TIMEOUT_MS = 15_000;
 const WORKER_EXECUTION_TIMEOUT_MS = 30_000;
@@ -145,20 +150,25 @@ describe('SQLite recovery authority multi-process races', () => {
   });
 
   it('never claims an active source while its terminal append races in another process', async () => {
-    await withPreparedDatabase(async ({ dbPath, startPath }) => {
-      const results = await runWorkers(dbPath, startPath, ['claim_nonterminal', 'append_source']);
-      assert.deepEqual(results.map(({ code }) => code).sort(), [0, 2]);
+    // Keep the source open but settle its tool so this race exercises the
+    // continuation/terminal serialization rather than the unsettled-tool guard.
+    await withPreparedDatabase(
+      async ({ dbPath, startPath }) => {
+        const results = await runWorkers(dbPath, startPath, ['claim_nonterminal', 'append_source']);
+        assert.deepEqual(results.map(({ code }) => code).sort(), [0, 2]);
 
-      const store = createSqliteRuntimeStore(dbPath);
-      try {
-        const sourceEvents = await store.readImmutableRuntimeEvents('session-1', 'run-1');
-        const claims = await store.listContinuationClaimsForRecovery('session-1');
-        assert.equal(sourceEvents.length, 3);
-        assert.equal(claims.length, 0);
-      } finally {
-        store.close();
-      }
-    });
+        const store = createSqliteRuntimeStore(dbPath);
+        try {
+          const sourceEvents = await store.readImmutableRuntimeEvents('session-1', 'run-1');
+          const claims = await store.listContinuationClaimsForRecovery('session-1');
+          assert.equal(sourceEvents.length, 4);
+          assert.equal(claims.length, 0);
+        } finally {
+          store.close();
+        }
+      },
+      { settlePreparedToolOperation: true },
+    );
   });
 
   it('serializes a continuation claim against an ordinary first target event', async () => {
@@ -288,6 +298,43 @@ describe('SQLite recovery authority multi-process races', () => {
     });
   });
 
+  it('grants durable managed mutation ownership to exactly one process', async () => {
+    await withPreparedDatabase(async ({ dbPath, startPath }) => {
+      const setupStore = createSqliteRuntimeStore(dbPath);
+      try {
+        bindWorkspaceBaselineAuthorityStoreRootInternal(setupStore, 'a'.repeat(64));
+        await commitWorkspaceBaselineInternal(setupStore, workspaceBaselineInput('a'));
+      } finally {
+        setupStore.close();
+      }
+      const results = await runWorkers(dbPath, startPath, [
+        'managed_mutation_a',
+        'managed_mutation_b',
+      ]);
+      assert.deepEqual(results.map(({ code }) => code).sort(), [0, 2]);
+      assert.equal(
+        results.filter(({ stderr }) => /managed mutation reservation conflict/i.test(stderr))
+          .length,
+        1,
+      );
+
+      const store = createSqliteRuntimeStore(dbPath);
+      try {
+        bindWorkspaceBaselineAuthorityStoreRootInternal(store, 'a'.repeat(64));
+        const reservation = await readActiveManagedMutationInternal(
+          store,
+          `instance_${'4'.repeat(32)}`,
+        );
+        assert.ok(
+          reservation?.operationId === 'managed-mutation-a' ||
+            reservation?.operationId === 'managed-mutation-b',
+        );
+      } finally {
+        store.close();
+      }
+    });
+  });
+
   it('serializes concurrent operational runtime migration', async () => {
     const root = await mkdtemp(join(tmpdir(), 'maka-operational-migration-race-'));
     const dbPath = join(root, 'runtime.sqlite');
@@ -297,6 +344,14 @@ describe('SQLite recovery authority multi-process races', () => {
       const db = new DatabaseSync(dbPath);
       try {
         db.exec(`
+          DROP TABLE runtime_managed_mutation_reservations;
+          DROP INDEX runtime_events_by_session_kind;
+          DROP INDEX runtime_events_one_opening_per_invocation;
+          DROP INDEX runtime_events_recovery_user_message;
+          DROP INDEX runtime_events_steering_message;
+          DROP INDEX runtime_events_tool_dispatch_operation;
+          DROP INDEX tool_operations_unsettled;
+          DROP TABLE runtime_legacy_invocation_openings;
           DROP TABLE runtime_session_event_ordinals;
           PRAGMA user_version = 10;
           UPDATE operational_schema_migrations SET version = 10 WHERE scope = 'runtime';
@@ -342,6 +397,7 @@ describe('SQLite recovery authority multi-process races', () => {
 
 async function withPreparedDatabase(
   run: (input: { dbPath: string; startPath: string }) => Promise<void>,
+  options: { settlePreparedToolOperation?: boolean } = {},
 ): Promise<void> {
   const root = await mkdtemp(join(tmpdir(), 'maka-recovery-race-'));
   const dbPath = join(root, 'runtime.sqlite');
@@ -350,6 +406,25 @@ async function withPreparedDatabase(
   try {
     bindWorkspaceBaselineAuthorityStoreRootInternal(store, 'a'.repeat(64));
     await store.commitToolPrepared(preparedCommit());
+    if (options.settlePreparedToolOperation) {
+      await store.commitToolOutcome({
+        operationId: 'operation-1',
+        journalEventId: 'operation-1_outcome',
+        runtimeEvent: {
+          ...baseEvent('operation-1_response', 3),
+          role: 'tool',
+          author: 'tool',
+          content: {
+            kind: 'function_response',
+            id: 'provider-call-1',
+            name: 'Write',
+            result: 'write completed',
+          },
+          refs: { operationId: 'operation-1', toolCallId: 'provider-call-1' },
+        },
+        committedAt: 3,
+      });
+    }
     await store.appendRuntimeEvent('session-1', 'continuation-source-run', {
       id: 'continuation-source-user',
       sessionId: 'session-1',
@@ -611,6 +686,36 @@ function preparedCommit() {
     canonicalArgsHash: hash,
     recoveryMode: 'reconcile' as const,
     committedAt: 2,
+  };
+}
+
+function workspaceBaselineInput(variant: 'a' | 'b'): WorkspaceBaselineAuthorityInput {
+  const alternate = variant === 'b';
+  return {
+    epochOpenedEventId: alternate ? 'workspace-epoch-event-b' : 'workspace-epoch-event-a',
+    baselineAcceptedEventId: alternate ? 'workspace-version-event-b' : 'workspace-version-event-a',
+    committedAt: 1_700_000_000_000,
+    epoch: {
+      repositoryId: `repository_${'1'.repeat(32)}`,
+      workspaceId: `workspace_${'2'.repeat(32)}`,
+      workspaceEpochId: `epoch_${'3'.repeat(32)}`,
+      workspaceInstanceId: `instance_${'4'.repeat(32)}`,
+      mode: 'managed_worktree',
+      objectFormat: 'sha1',
+      sourceCommitOid: '1'.repeat(40),
+      sourceTreeOid: '2'.repeat(40),
+      materializationProfileDigest: `sha256:${'3'.repeat(64)}`,
+      materializationSemantics: 'git_tree_materialized_with_fixed_config_v1',
+      policyHash: `sha256:${'4'.repeat(64)}`,
+    },
+    baseline: {
+      workspaceVersionId: `version_${(alternate ? '9' : '5').repeat(32)}`,
+      commitOid: (alternate ? '9' : '5').repeat(40),
+      treeOid: '2'.repeat(40),
+      treeDeltaDigest: `sha256:${'6'.repeat(64)}`,
+      changedFileCount: 7,
+      deletedFileCount: 0,
+    },
   };
 }
 

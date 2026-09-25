@@ -28,7 +28,6 @@ import {
   showSessionWorkspaceUnavailableToast,
 } from './session-workspace-errors.js';
 import { acquireSessionCopyAttempt } from './session-copy-attempt.js';
-import type { MessageListUpdater } from './session-workspace-actions.js';
 
 type RefBox<T> = { current: T };
 
@@ -50,47 +49,39 @@ export interface AppShellTurnActions {
 export function createAppShellTurnActions(deps: {
   uiLocale: UiLocale;
   activeIdRef: RefBox<string | undefined>;
-  addPendingTurnAction: (key: string) => boolean;
-  clearPendingTurnAction: (key: string) => void;
+  captureSelection(): () => boolean;
+  turnActionRegistry: {
+    addKey(key: string): boolean;
+    clearKey(key: string): void;
+    keyOf(sessionId: string, turnId: string, actionId: string): string;
+  };
   openSessionInChat: (sessionId: string, turnId?: string) => void;
-  pendingKeyOf: (sessionId: string, turnId: string, actionId: TurnFooterActionMeta['id']) => string;
-  refreshMessages: (sessionId: string) => Promise<boolean>;
   refreshSessions: () => Promise<DesktopSessionSummary[]>;
-  setMessages: MessageListUpdater;
   toastApi: ToastApi;
 }): AppShellTurnActions {
   const {
     uiLocale,
     activeIdRef,
-    addPendingTurnAction,
-    clearPendingTurnAction,
+    captureSelection,
+    turnActionRegistry,
     openSessionInChat,
-    pendingKeyOf,
-    refreshMessages,
     refreshSessions,
-    setMessages,
     toastApi,
   } = deps;
   const copy = getDesktopConversationCopy(uiLocale).actions;
 
-  async function handleTurnFooterAction(turnId: string, actionId: TurnFooterActionMeta['id']): Promise<void> {
+  async function handleTurnFooterAction(turnId: string, actionId: TurnFooterActionMeta['id']) {
     if (actionId === 'copy') return; // handled in-component
     const sessionId = activeIdRef.current;
     if (!sessionId) return;
-    const key = pendingKeyOf(sessionId, turnId, actionId);
+    const selectionIsCurrent = captureSelection();
+    const key = turnActionRegistry.keyOf(sessionId, turnId, actionId);
     // Ref-backed guard blocks same-frame double clicks before React has
     // committed the disabled state. State alone is too late here because
-    // retry/regenerate IPC returns after starting the stream asynchronously.
-    if (!addPendingTurnAction(key)) return;
+    // Branch IPC returns after the copy starts asynchronously.
+    if (!turnActionRegistry.addKey(key)) return;
     try {
-      if (actionId === 'regenerate') {
-        await window.maka.sessions.regenerateTurn(sessionId, {
-          sourceTurnId: turnId,
-        });
-        if (activeIdRef.current === sessionId) {
-          toastApi.info(copy.regenerateStartedTitle, copy.regenerateStartedDescription);
-        }
-      } else if (actionId === 'branch') {
+      if (actionId === 'branch') {
         const copyAttempt = acquireSessionCopyAttempt(
           {
             scope: `turn-footer:${turnId}`,
@@ -104,16 +95,14 @@ export function createAppShellTurnActions(deps: {
           copyId: copyAttempt.copyId,
         });
         copyAttempt.complete();
-        if (activeIdRef.current === sessionId) {
+        await refreshSessions();
+        if (selectionIsCurrent()) {
           openSessionInChat(newSession.id);
-          setMessages([]);
-          await refreshMessages(newSession.id);
           toastApi.success(copy.branchCreatedTitle, copy.branchCreatedDescription(newSession.name));
         }
-        await refreshSessions();
       }
     } catch (error) {
-      if (activeIdRef.current !== sessionId) return;
+      if (!selectionIsCurrent()) return;
       if (isSessionWorkspaceUnavailableError(error)) {
         showSessionWorkspaceUnavailableToast(toastApi, uiLocale, { sessionId });
       } else {
@@ -125,7 +114,7 @@ export function createAppShellTurnActions(deps: {
         );
       }
     } finally {
-      clearPendingTurnAction(key);
+      turnActionRegistry.clearKey(key);
     }
   }
 

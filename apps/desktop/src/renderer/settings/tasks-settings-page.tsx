@@ -28,6 +28,7 @@ import { List, ListItem } from '@astryxdesign/core/List';
 import { TextInput } from '@astryxdesign/core/TextInput';
 import type { SessionPurgeOutcome } from '../features/session-navigation';
 import type { DesktopSessionSummary } from '../../preload/bridge-contract.js';
+import type { SessionCatalogController } from '../application/contracts/session-catalog/session-catalog-state.js';
 import { getSettingsSharedCopy } from '../locales/settings-shared-copy.js';
 import { getSettingsTasksCopy } from '../locales/settings-tasks-copy.js';
 import { settingsActionErrorMessage } from './settings-error-copy';
@@ -44,7 +45,7 @@ import {
  * not have to understand.
  */
 export interface ArchivedTasksBridge {
-  sessions: readonly DesktopSessionSummary[];
+  catalog: SessionCatalogController;
   projects: readonly ProjectRecord[];
   onRestore(sessionId: string): void;
   onDelete(sessionId: string): void;
@@ -73,7 +74,9 @@ export interface ArchivedTasksBridge {
  * changed. What is genuinely new here is finding a task by name or project, and
  * clearing a set of them in one pass.
  */
-export function TasksSettingsPage(props: ArchivedTasksBridge) {
+export function TasksSettingsPage(
+  props: ArchivedTasksBridge & { sessions: readonly DesktopSessionSummary[] },
+) {
   const locale = useUiLocale();
   const copy = getSettingsTasksCopy(locale);
   const toast = useToast();
@@ -125,7 +128,7 @@ export function TasksSettingsPage(props: ArchivedTasksBridge) {
       title: isSearching
         ? copy.purgeMatchesConfirmTitle(ids.length)
         : copy.purgeAllConfirmTitle(ids.length),
-      description: copy.purgeConfirmBody,
+      description: `${copy.purgeConfirmBody} ${copy.purgeSubtaskNote}`,
       confirmLabel: copy.purgeConfirmAction,
       cancelLabel: getSettingsSharedCopy(locale).cancel,
       destructive: true,
@@ -140,6 +143,14 @@ export function TasksSettingsPage(props: ArchivedTasksBridge) {
       // dropping the other is how a count quietly stops adding up.
       const kept =
         outcome.restored.length > 0 ? copy.purgeKeptRestored(outcome.restored.length) : undefined;
+      // A bulk purge of parents archives their linked subtasks; say how many so
+      // the archived rows that appear next are not a surprise.
+      const moved =
+        outcome.archivedSubtasks > 0 ? copy.purgedSubtaskNote(outcome.archivedSubtasks) : undefined;
+      const detail = (...parts: Array<string | undefined>) => {
+        const text = parts.filter(Boolean).join(' ');
+        return text.length > 0 ? text : undefined;
+      };
       if (!outcome.verified || outcome.remaining.length > 0) {
         // A reason beats a count: a task refuses to retire while its turn is
         // still running, and "N still there" gives the reader nothing to do.
@@ -150,14 +161,14 @@ export function TasksSettingsPage(props: ArchivedTasksBridge) {
             : copy.purgeFailedBody(outcome.remaining.length);
         toast.error(
           copy.purgeFailedTitle,
-          kept ? `${reason} ${kept}` : reason,
+          detail(reason, moved, kept),
           undefined,
           outcome.firstFailure
             ? { sessionId: outcome.firstFailure.sessionId }
             : undefined,
         );
       } else {
-        toast.success(copy.purgedToast(outcome.removed), kept);
+        toast.success(copy.purgedToast(outcome.removed), detail(moved, kept));
       }
     } finally {
       if (mountedRef.current) setPurging(false);

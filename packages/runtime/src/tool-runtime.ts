@@ -20,6 +20,7 @@
 import { decodeCanonicalToolResultContent } from '@maka/core/tool-result-record-schema';
 import { projectAgentSwarmResult } from '@maka/core/agent-swarm';
 import { projectToolActivityArgs } from '@maka/core/tool-activity-args';
+import { resolveCollaborationPermissionMode } from '@maka/core/collaboration';
 import {
   type CreateSandboxBoundaryRequest,
   type ExecutionBoundary,
@@ -32,6 +33,8 @@ import {
 import { serializedByteLength } from '@maka/core/serialized-byte-length';
 import { encodeToolStepProgress, ToolOutcomeUnknownError } from '@maka/core/events';
 import type {
+  FormAnswerAckEvent,
+  FormRequestEvent,
   SandboxBoundaryDecisionAckEvent,
   SandboxBoundaryRequestEvent,
   SessionEvent,
@@ -45,13 +48,21 @@ import type {
   ToolUncertainOutcomeSignal,
   UserQuestionRequestEvent,
 } from '@maka/core/events';
-import type { ToolCallMessage, ToolResultMessage } from '@maka/core/session';
 import type {
+  HostedFormSettlement,
   HostedInteractionBridge,
   HostedSandboxBoundarySettlement,
   HostedUserQuestionAnswer,
   HostedUserQuestionSettlement,
 } from '@maka/core/backend-types';
+import {
+  isInteractionAnswerValidForRequest,
+  projectInteractionFormRequest,
+  type InteractionFormInput,
+  type InteractionFormRequest,
+  type InteractionFormResponse,
+  type InteractionFormResult,
+} from '@maka/core/interaction';
 import type { PermissionMode, ToolCategory, ToolExecutionFacts } from '@maka/core/permission';
 import type { RuntimeExecutionConnection } from '@maka/core/llm-connections';
 import type { OrchestrationMode } from '@maka/core/orchestration';
@@ -74,8 +85,18 @@ import { stableHash } from './request-shape.js';
 import { classifyError } from './provider-error-classification.js';
 import type { RunTraceLike } from './run-trace.js';
 import { AwaitRegistry } from './await-registry.js';
-import { jsonValue } from './tool-result-output.js';
 import type { ToolResultOutput } from './model-protocol.js';
+import {
+  compatibilityToolResultProjection,
+  encodeDefaultDurableToolResultOutput,
+  encodeDurableToolResultOutput,
+  encodeDurableToolResultOutputWithArtifacts,
+} from './durable-tool-result-projection.js';
+import {
+  DURABLE_TOOL_RESULT_PROJECTION_FAILURE,
+  type DurableProjectionArtifactRef,
+  type DurableToolResultProjection,
+} from '@maka/core/durable-tool-result-projection';
 import {
   buildToolOperationId,
   canonicalToolArgsHash,
@@ -130,12 +151,24 @@ export interface DurableSessionEventSink {
 
 export interface ToolSettlement {
   result: unknown;
-  modelOutput: ToolResultOutput;
+  providerError?: string;
 }
 
-export interface RawToolSettlement {
-  result: unknown;
-  providerError?: string;
+export type MakaToolPreparationContext = Pick<
+  MakaToolContext,
+  | 'sessionId'
+  | 'runId'
+  | 'turnId'
+  | 'cwd'
+  | 'executionBoundary'
+  | 'permissionMode'
+  | 'toolCallId'
+  | 'abortSignal'
+>;
+
+export interface PreparedMakaToolExecution<R = unknown> {
+  execute(context: MakaToolContext): Promise<R> | R;
+  cancel(): Promise<void> | void;
 }
 
 export interface MakaTool<P = any, R = unknown> {
@@ -151,6 +184,8 @@ export interface MakaTool<P = any, R = unknown> {
   activityKind?: ToolActivityKind;
   /** Optional trusted category override for custom tools. */
   categoryHint?: ToolCategory;
+  /** Host-owned admission contract, independent of model/UI tool categorization. */
+  hostAdmission?: 'client_capability';
   /** Optional trusted facts about the executor that runs this tool. */
   executionFacts?: ToolExecutionFacts;
   /**
@@ -158,7 +193,11 @@ export interface MakaTool<P = any, R = unknown> {
    * client-executed tools such as ApplyPatch still settle through ToolRuntime.
    */
   providerTool?: {
-    readonly kind: 'openai-apply-patch' | 'openai-web-search' | 'anthropic-web-search-20250305';
+    readonly kind:
+      | 'openai-apply-patch'
+      | 'codex-apply-patch'
+      | 'openai-web-search'
+      | 'anthropic-web-search-20250305';
     readonly searchContextSize?: 'low' | 'medium' | 'high';
     readonly maxUses?: number;
   };
@@ -173,18 +212,30 @@ export interface MakaTool<P = any, R = unknown> {
     args: P,
     context: Pick<MakaToolContext, 'sessionId' | 'turnId' | 'toolCallId'>,
   ) => unknown;
+  /** Optional preparation that settles before ToolRuntime crosses its durable T1 cut. */
+  prepareExecution?: (
+    args: P,
+    context: MakaToolPreparationContext,
+  ) => Promise<PreparedMakaToolExecution<R>>;
   /**
    * Real tool implementation. Implementations must observe `ctx.abortSignal` and
    * settle promptly after it aborts. Runtime-owned nested calls await this
    * settlement instead of detaching, so late side effects cannot outlive `exec`.
    */
   impl: (args: P, ctx: MakaToolContext) => Promise<R> | R;
-  /** Optional provider-visible content mapping, used for screenshot image parts. */
+  /** Best-effort compensation after T2 rejects a result that already produced side effects. */
+  compensateDurableOutcomeCommitFailure?: (input: {
+    readonly result: unknown;
+    readonly isError: boolean;
+    readonly sessionId: string;
+    readonly operationId: string;
+  }) => Promise<void> | void;
+  /** Synchronous model mapping. Return undefined to use the canonical default projection. */
   toModelOutput?: (options: {
     toolCallId: string;
     input: unknown;
     output: unknown;
-  }) => ToolResultOutput | PromiseLike<ToolResultOutput>;
+  }) => ToolResultOutput | undefined;
 }
 
 export interface MakaToolContext {
@@ -220,6 +271,7 @@ export interface MakaToolContext {
   spawnChildSession?: (input: {
     agentProfile: AgentProfile;
     subagentId?: string;
+    executorId?: string;
     prompt: string;
     /** Optional swarm identity, scoped to the owning tool call. */
     swarm?: {
@@ -248,13 +300,16 @@ export interface MakaToolContext {
     view?: 'result' | 'events' | 'runtime_events' | 'all';
   }) => Promise<unknown>;
   askUserQuestion?: (questions: UserQuestion[]) => Promise<UserQuestionResult>;
+  requestUserForm?: (
+    form: InteractionFormInput,
+    options?: { readonly cancellationSignal?: AbortSignal },
+  ) => Promise<InteractionFormResult>;
   requestSandboxBoundary?: (
     expansion: SandboxBoundaryExpansion,
     justification: string,
   ) => Promise<SandboxBoundarySettlement>;
 }
 
-export type AppendMessageFn = (m: ToolCallMessage | ToolResultMessage) => Promise<void>;
 export type ToolTelemetryRecorder = (record: ToolInvocationRecord) => void;
 
 /**
@@ -286,11 +341,17 @@ const SANDBOX_BOUNDARY_FAILURE_ROUND_LIMIT = 3;
 
 type SandboxBoundaryFailureKind = 'invalid' | 'unresolved';
 type SandboxBoundaryFailureDetails = Extract<ToolResultContent, { kind: 'text' }>['sandboxFailure'];
+type ToolActivityIdentity = Pick<
+  ToolResultEvent,
+  'origin' | 'modelVisibility' | 'parentToolCallId' | 'parentOperationId'
+>;
 
 const SUBAGENT_TOOL_LIMIT_MESSAGE =
   '子代理并发过多：同一轮最多 5 个子代理。请等待已有任务完成后再继续。';
 const CLIENT_CAPABILITY_BOUNDARY_MESSAGE =
   'Client Capability tools require the Bypass execution boundary because their client-side effects cannot be sandboxed by the Host. Switch this Session to Bypass and retry.';
+const CLIENT_CAPABILITY_PREPARATION_MESSAGE =
+  'Client Capability tool is missing its Host admission preparation contract.';
 
 function composeChildAbortSignal(
   invocationSignal: AbortSignal,
@@ -301,12 +362,14 @@ function composeChildAbortSignal(
 }
 
 export interface ToolRuntimeInput {
+  /** Runtime-owned projection of explicit denials in authenticated continuation ancestors. */
+  inheritedSandboxBoundaryDenied?: boolean;
   sessionId: string;
   header: SessionHeader;
   connection: RuntimeExecutionConnection;
   modelId: string;
-  appendMessage: AppendMessageFn;
   readExecutionBoundary: () => Promise<ExecutionBoundary>;
+  readPermissionMode: () => Promise<PermissionMode>;
   createSandboxBoundaryRequest?: (
     input: CreateSandboxBoundaryRequest,
   ) => Promise<SandboxBoundaryRequest>;
@@ -334,16 +397,23 @@ export interface ToolRuntimeInput {
   runId?: string;
   orchestrationMode?: OrchestrationMode;
   invocationId?: string;
-  materializeDefaultToolResultOutput?: (options: {
-    toolCallId: string;
-    output: unknown;
-  }) => ToolResultOutput | PromiseLike<ToolResultOutput>;
+  prepareDurableProjectionArtifact?: (input: {
+    turnId: string;
+    bytes: Uint8Array;
+    mediaType: string;
+  }) => {
+    ref: Extract<DurableProjectionArtifactRef, { kind: 'session_file' }>;
+    persist(): Promise<void>;
+    /** Reclaim this publication when the projection is rejected (#4283). */
+    retract?(): Promise<void>;
+  };
   spawnChildSession?: (input: {
     parentRunId: string;
     parentTurnId: string;
     toolCallId: string;
     agentProfile: AgentProfile;
     subagentId?: string;
+    executorId?: string;
     prompt: string;
     swarm?: {
       swarmId: string;
@@ -378,10 +448,10 @@ export interface ToolRuntimeInput {
 
 interface DurableToolAttempt {
   operationId: string;
-  responseEventId: string;
   commitOutcome(
     result: unknown,
     isError: boolean,
+    modelProjection: DurableToolResultProjection,
     durationMs?: number,
   ): Promise<{ id: string; operationId: string; ts: number }>;
 }
@@ -417,10 +487,15 @@ export class ToolRuntime {
     UserQuestionResponse,
     { toolUseId: string; questions: UserQuestion[]; hosted: boolean }
   >();
+  private readonly userForms = new AwaitRegistry<
+    InteractionFormResponse,
+    { toolUseId: string; request: InteractionFormRequest; hosted: boolean }
+  >();
   private readonly turnId: string;
   private readonly hostedInteraction: HostedInteractionBridge | undefined;
   private sandboxBoundaryClosureDeferred = false;
   private questionClosureDeferred = false;
+  private formClosureDeferred = false;
   private activeSubagentToolCount = 0;
   private childAgentRunLimiter = new AdmissionLimiter(MAX_ACTIVE_CHILD_AGENT_RUNS_PER_TURN);
   /**
@@ -452,6 +527,7 @@ export class ToolRuntime {
   private readonly durableToolAttempts = new Map<string, DurableToolAttempt>();
   private readonly activeToolSettlements = new Set<Promise<unknown>>();
   private readonly readExecutionBoundary: NonNullable<ToolRuntimeInput['readExecutionBoundary']>;
+  private readonly readPermissionMode: NonNullable<ToolRuntimeInput['readPermissionMode']>;
   private readonly stepAdmissions = new Map<
     string,
     { callCount: number; exclusiveToolName?: string }
@@ -459,6 +535,9 @@ export class ToolRuntime {
   constructor(private readonly input: ToolRuntimeInput) {
     if (!input.readExecutionBoundary) {
       throw new Error('ToolRuntime requires explicit execution boundary authority');
+    }
+    if (!input.readPermissionMode) {
+      throw new Error('ToolRuntime requires explicit permission mode authority');
     }
     const hosted = input.hostedInteraction;
     if (hosted && (hosted.sessionId !== input.sessionId || hosted.turnId !== input.turnId)) {
@@ -469,6 +548,24 @@ export class ToolRuntime {
     this.turnId = input.turnId;
     this.hostedInteraction = hosted;
     this.readExecutionBoundary = input.readExecutionBoundary;
+    this.sandboxBoundaryDenied = input.inheritedSandboxBoundaryDenied === true;
+    this.readPermissionMode = input.readPermissionMode;
+  }
+
+  /**
+   * The permission mode in force for this dispatch.
+   *
+   * A Bypass boundary is an unambiguous live grant. A managed boundary is not:
+   * an approved path or network expansion changes its structural display mode
+   * without changing the mode the user selected. Keep that selection live in
+   * its own authority, then apply the collaboration overlay for this backend.
+   */
+  private async livePermissionMode(boundary: ExecutionBoundary): Promise<PermissionMode> {
+    const permissionMode = boundary.kind === 'bypass' ? 'bypass' : await this.readPermissionMode();
+    return resolveCollaborationPermissionMode({
+      collaborationMode: this.input.header.collaborationMode ?? 'agent',
+      permissionMode,
+    });
   }
 
   async endTurn(reason: 'completed' | 'aborted' = 'completed'): Promise<void> {
@@ -494,6 +591,7 @@ export class ToolRuntime {
               sessionId: this.input.sessionId,
               requestId,
               decision: 'deny',
+              closureReason: reason === 'aborted' ? 'turn_stopped' : 'turn_terminal',
             });
           }),
         );
@@ -504,6 +602,7 @@ export class ToolRuntime {
     }
 
     const hasHostedPending = this.userQuestions.entries().some(([, question]) => question.hosted);
+    const hasHostedFormPending = this.userForms.entries().some(([, form]) => form.hosted);
     if (hasHostedBoundaryPending) {
       this.sandboxBoundaryClosureDeferred = true;
       this.finishDeferredSandboxBoundaryTurnClosure();
@@ -523,6 +622,16 @@ export class ToolRuntime {
           new Error(`Turn ${turnId} ${reason} before user question ${requestId} was answered`),
       );
       this.questionClosureDeferred = false;
+    }
+    if (hasHostedFormPending) {
+      this.formClosureDeferred = true;
+      this.finishDeferredFormTurnClosure();
+    } else {
+      this.userForms.close(
+        (requestId) =>
+          new Error(`Turn ${turnId} ${reason} before user form ${requestId} was answered`),
+      );
+      this.formClosureDeferred = false;
     }
     this.resetTurnState();
     // The stop path settles the run's terminal fact right after the
@@ -556,6 +665,22 @@ export class ToolRuntime {
       );
     }
     return this.settleUserQuestionAnswer(turnId, response, pending);
+  }
+
+  respondToUserForm(response: InteractionFormResponse): boolean {
+    if (!response || typeof response.requestId !== 'string') {
+      throw new Error('Invalid user form response');
+    }
+    const pending = this.userForms
+      .entries()
+      .find(([requestId]) => requestId === response.requestId)?.[1];
+    if (!pending) return false;
+    if (pending.hosted) {
+      throw new RuntimeInteractionInvariantError(
+        `Hosted form ${response.requestId} must settle through its captured continuation`,
+      );
+    }
+    return this.settleUserFormAnswer(response, pending);
   }
 
   async respondToSandboxBoundaryResponse(response: {
@@ -608,6 +733,22 @@ export class ToolRuntime {
     return resolved;
   }
 
+  private settleUserFormAnswer(
+    response: InteractionFormResponse,
+    pending: { toolUseId: string; request: InteractionFormRequest; hosted: boolean },
+  ): boolean {
+    const answer =
+      response.action === 'accept'
+        ? { kind: 'form' as const, action: 'accept' as const, values: response.values }
+        : { kind: 'form' as const, action: response.action };
+    if (!isInteractionAnswerValidForRequest(pending.request, answer)) {
+      throw new Error('Invalid user form response');
+    }
+    const resolved = this.userForms.resolve(response.requestId, response) !== null;
+    this.finishDeferredFormTurnClosure();
+    return resolved;
+  }
+
   closeUserQuestion(
     turnId: string,
     requestId: string,
@@ -620,8 +761,20 @@ export class ToolRuntime {
     return closed;
   }
 
+  closeUserForm(requestId: string, reason: RuntimeInteractionClosureReason): boolean {
+    const closed =
+      this.userForms.reject(requestId, new RuntimeInteractionClosedError(requestId, reason)) !==
+      null;
+    this.finishDeferredFormTurnClosure();
+    return closed;
+  }
+
   pendingUserQuestionCount(): number {
     return this.userQuestions.pendingCount();
+  }
+
+  pendingUserFormCount(): number {
+    return this.userForms.pendingCount();
   }
 
   /**
@@ -629,38 +782,6 @@ export class ToolRuntime {
    * provider-facing error output; durable runtime commit failures still reject.
    */
   async settleToolCall(call: ResolvedMakaToolCall): Promise<ToolSettlement> {
-    const settlement = await this.settleToolCallRaw(call);
-    const modelOutput = settlement.providerError
-      ? call.tool.providerTool?.kind === 'openai-apply-patch'
-        ? {
-            type: 'json' as const,
-            value: { status: 'failed' as const, output: settlement.providerError },
-          }
-        : { type: 'error-text' as const, value: new Error(settlement.providerError).toString() }
-      : call.tool.toModelOutput
-        ? await call.tool.toModelOutput({
-            toolCallId: call.toolCallId,
-            input: call.input,
-            output: settlement.result,
-          })
-        : this.input.materializeDefaultToolResultOutput
-          ? await this.input.materializeDefaultToolResultOutput({
-              toolCallId: call.toolCallId,
-              output: settlement.result,
-            })
-          : typeof settlement.result === 'string'
-            ? { type: 'text' as const, value: settlement.result }
-            : { type: 'json' as const, value: jsonValue(settlement.result) };
-    return { result: settlement.result, modelOutput };
-  }
-
-  /**
-   * Settle a tool without producing provider-visible output. Runtime-owned
-   * nested calls use this path because their result is consumed by Code Mode,
-   * not sent as a provider tool-result part; materializing it could spend
-   * turn-scoped provider resources such as the image budget.
-   */
-  async settleToolCallRaw(call: ResolvedMakaToolCall): Promise<RawToolSettlement> {
     const settlement = this.performToolSettlement(call);
     // Tracked so endTurn can wait out unwinds already in flight (#2253):
     // their T2 outcomes must land before the stop path settles the run's
@@ -673,7 +794,7 @@ export class ToolRuntime {
     return settlement;
   }
 
-  private async performToolSettlement(call: ResolvedMakaToolCall): Promise<RawToolSettlement> {
+  private async performToolSettlement(call: ResolvedMakaToolCall): Promise<ToolSettlement> {
     const result = await this.executeTool(
       call.tool,
       call.turnId,
@@ -692,6 +813,57 @@ export class ToolRuntime {
     );
     const providerError = providerToolErrorMessage(result);
     return { result, ...(providerError ? { providerError } : {}) };
+  }
+
+  private projectToolResult(
+    tool: MakaTool,
+    turnId: string,
+    toolCallId: string,
+    input: unknown,
+    result: unknown,
+  ): DurableToolResultProjection | PromiseLike<DurableToolResultProjection> {
+    try {
+      const providerError = providerToolErrorMessage(result);
+      if (providerError) {
+        return encodeDurableToolResultOutput(
+          tool.providerTool?.kind === 'openai-apply-patch'
+            ? {
+                type: 'json' as const,
+                value: { status: 'failed' as const, output: providerError },
+              }
+            : { type: 'error-text' as const, value: new Error(providerError).toString() },
+          this.input.sessionId,
+        );
+      }
+      if (!tool.toModelOutput) {
+        return encodeDefaultDurableToolResultOutput(result, this.input.sessionId);
+      }
+      const output = tool.toModelOutput({ toolCallId, input, output: result });
+      if (output === undefined)
+        return encodeDefaultDurableToolResultOutput(result, this.input.sessionId);
+      // Projection is deliberately synchronous and total at the tool boundary.
+      // Fail closed for untyped/plugin implementations that violate the
+      // contract so a completed effect can never be stranded before T2.
+      if (isPromiseLike<ToolResultOutput>(output)) {
+        return DURABLE_TOOL_RESULT_PROJECTION_FAILURE;
+      }
+      const encode = (resolved: ToolResultOutput) =>
+        encodeDurableToolResultOutputWithArtifacts(
+          resolved,
+          this.input.sessionId,
+          this.input.prepareDurableProjectionArtifact
+            ? ({ bytes, mediaType }) =>
+                this.input.prepareDurableProjectionArtifact!({
+                  turnId,
+                  bytes,
+                  mediaType,
+                })
+            : undefined,
+        );
+      return encode(output);
+    } catch {
+      return DURABLE_TOOL_RESULT_PROJECTION_FAILURE;
+    }
   }
 
   /**
@@ -811,20 +983,16 @@ export class ToolRuntime {
     this.lastFailedToolCallBoundaryDetails = boundaryDetails;
   }
 
-  async writeSyntheticToolResult(
+  private async writeSyntheticToolResult(
     toolUseId: string,
     turnId: string,
+    toolName: string,
     text: string,
     queue: DurableSessionEventSink,
     sandboxDenial?: SandboxDenialSignal,
     sandboxFailure?: Extract<ToolResultContent, { kind: 'text' }>['sandboxFailure'],
     uncertainOutcome?: ToolUncertainOutcomeSignal,
-    activityIdentity: {
-      origin?: 'provider' | 'code_mode';
-      modelVisibility?: 'visible' | 'hidden';
-      parentToolCallId?: string;
-      parentOperationId?: string;
-    } = {},
+    activityIdentity: ToolActivityIdentity = {},
     attempt?: DurableToolAttempt,
   ): Promise<void> {
     const content: ToolResultContent = {
@@ -844,28 +1012,58 @@ export class ToolRuntime {
     // guards, where no attempt exists and no identity is owed.
     const durableAttempt =
       attempt ?? this.durableToolAttempts.get(durableAttemptKey(turnId, toolUseId));
-    const durableOutcome = await durableAttempt?.commitOutcome(content, true);
-    const msg: ToolResultMessage = {
-      type: 'tool_result',
-      id: this.input.newId(),
+    const modelProjection =
+      compatibilityToolResultProjection(
+        {
+          kind: 'function_response',
+          id: toolUseId,
+          name: toolName,
+          result: content,
+          isError: true,
+        },
+        this.input.sessionId,
+      ) ?? DURABLE_TOOL_RESULT_PROJECTION_FAILURE;
+    await this.commitAndPublishToolResult({
+      queue,
       turnId,
-      ts: this.input.now(),
       toolUseId,
       isError: true,
       content,
-      ...activityIdentity,
-    };
-    await this.input.appendMessage(msg);
-    queue.push({
+      modelProjection,
+      activityIdentity,
+      durableAttempt,
+    });
+  }
+
+  private async commitAndPublishToolResult(input: {
+    queue: DurableSessionEventSink;
+    turnId: string;
+    toolUseId: string;
+    isError: boolean;
+    content: ToolResultContent;
+    modelProjection: DurableToolResultProjection;
+    durationMs?: number;
+    activityIdentity: ToolActivityIdentity;
+    durableAttempt?: DurableToolAttempt;
+  }): Promise<void> {
+    const durableOutcome = await input.durableAttempt?.commitOutcome(
+      input.content,
+      input.isError,
+      input.modelProjection,
+      input.durationMs,
+    );
+    input.queue.push({
       type: 'tool_result',
       id: durableOutcome?.id ?? this.input.newId(),
-      turnId,
+      turnId: input.turnId,
       ts: durableOutcome?.ts ?? this.input.now(),
-      toolUseId,
+      toolUseId: input.toolUseId,
       ...(durableOutcome ? { operationId: durableOutcome.operationId } : {}),
-      isError: true,
-      content,
-      ...activityIdentity,
+      isError: input.isError,
+      content: input.content,
+      modelProjection: input.modelProjection,
+      ...(input.durationMs !== undefined ? { durationMs: input.durationMs } : {}),
+      ...input.activityIdentity,
     } satisfies ToolResultEvent);
   }
 
@@ -885,7 +1083,7 @@ export class ToolRuntime {
     },
     stepId?: string,
   ): Promise<unknown> {
-    const rawExecutionArgs = snapshotToolArgs(args);
+    const executionArgs = snapshotToolArgs(args);
     const sandboxBoundaryDecisionGeneration = this.sandboxBoundaryDecisionGeneration;
     const toolUseId = ctx.toolCallId;
     // Registration is synchronous and happens before the first await, so
@@ -895,20 +1093,18 @@ export class ToolRuntime {
         ? `Tool ${tool.name} is direct-only and cannot run inside exec.`
         : undefined;
     const admissionFailure = directOnlyFailure ?? this.admitToolForStep(tool, stepId);
-    const executionArgs = rawExecutionArgs;
     let permissionArgs = executionArgs;
     let permissionArgsError: unknown;
     if (directOnlyFailure === undefined) {
       try {
-        // A surface that cannot carry a sandbox-boundary request rejects the
-        // operation before it interprets the requested expansion. Preserve that
-        // availability contract even when an older caller sends a legacy shape.
+        // An unavailable sandbox-boundary surface rejects the expansion before
+        // interpreting it, including legacy shapes whose validation stays deferred.
         const sandboxBoundaryUnavailable =
           tool.name === 'request_sandbox_boundary' &&
           !this.interactionRun() &&
           (!this.input.createSandboxBoundaryRequest || !this.input.settleSandboxBoundaryRequest);
         if (!sandboxBoundaryUnavailable) {
-          await validateDeclaredToolArgs(tool.parameters, rawExecutionArgs);
+          await validateDeclaredToolArgs(tool.parameters, executionArgs);
         }
         permissionArgs = tool.permissionArgs
           ? snapshotToolArgs(
@@ -923,42 +1119,13 @@ export class ToolRuntime {
         permissionArgsError = error;
       }
     }
-    // The args written into the `tool_start` event, the persisted `tool_call`
-    // message and the durable ledger — that is, the record of the call the
-    // model reads back on its next turn (`model-history.ts` replays
-    // `event.content.args`).
-    //
-    // Computer Use used the host's approval summary here. That projection
-    // exists to decide and display a permission: it renames `window_id` to
-    // `windowId`, adds `approvalClass` and `rememberForTurnAllowed`, and drops
-    // every argument it does not need. On the real ToolRuntime a model that
-    // sent {action:'press_key', app, window_id, observation_id, element_id,
-    // text:'cmd+s'} read back {action, approvalClass, rememberForTurnAllowed,
-    // app, windowId, observationId} — a key the tool rejects, two fields it
-    // never sent, no element, and a press_key with no key. It then went on
-    // calling it that way.
-    //
-    // The permission prompt still reads `permissionArgs`, and the approval
-    // scope key is still computed from the raw call, so this only changes what
-    // is written down. `computerUseModelCallArgs` keeps the same privacy rule
-    // — screen-derived and user-typed values are reduced to a shape — and
-    // speaks the tool's own argument names.
+    // Permission args are a policy/UI projection. Persistence and model replay
+    // share one canonical tool-dialect projection; Computer Use also strips
+    // screen-derived and user-typed values at this boundary.
     const persistedArgs =
       tool.categoryHint === 'computer_use'
         ? snapshotToolArgs(computerUseModelCallArgs(permissionArgs))
         : permissionArgs;
-    // What the model will read back as its own call. The approval summary is
-    // the host's projection for deciding a permission, and using it here taught
-    // the model to call the tool with `approvalClass`, `rememberForTurnAllowed`
-    // and `windowId` — two fields it does not take and one key in a dialect it
-    // rejects. Same privacy boundary, names the tool accepts.
-    //
-    // The same projection as the audit record, since `computerUseModelCallArgs`
-    // became what both are written with. It was spelled out twice, which meant
-    // running it twice per call and leaving two expressions to drift apart. The
-    // two names stay because the roles are different — one is what the host
-    // records, one is what the model reads — and a divergence would go here.
-    const modelFacingArgs = persistedArgs;
     const now = this.input.now();
     const trace = this.input.getRunTrace?.() ?? null;
     const runId = this.input.runId;
@@ -1031,20 +1198,29 @@ export class ToolRuntime {
       ...(tool.displayName ? { displayName: tool.displayName } : {}),
       ...(stepId !== undefined ? { stepId } : {}),
     };
-    let pushedCallEvent: ToolStartEvent | undefined;
-    const pushCallEvent = (lane: 'dispatch' | 'preflight'): ToolStartEvent => {
-      // Idempotent by construction: one call, one call event, whichever lane
-      // asks for it first. A second ask cannot mint a second id.
-      if (pushedCallEvent) return pushedCallEvent;
+    let callEvent: ToolStartEvent | undefined;
+    const buildCallEvent = (lane: 'dispatch' | 'preflight'): ToolStartEvent => {
+      if (callEvent) return callEvent;
       const operationId = lane === 'dispatch' ? dispatchOperationId : undefined;
-      const event: ToolStartEvent = {
+      callEvent = {
         ...callEventFacts,
         id: operationId ? `${operationId}_call` : this.input.newId(),
         ...(operationId ? { operationId } : {}),
       };
+      return callEvent;
+    };
+    let callEventPublished = false;
+    const publishCallEvent = (event: ToolStartEvent): void => {
+      if (callEventPublished) return;
       queue.push(event);
-      pushedCallEvent = event;
-      return event;
+      callEventPublished = true;
+    };
+    const emitToolStartedTrace = (): void => {
+      trace?.emit('tool', 'tool_started', 'Tool execution started', {
+        toolUseId,
+        toolName: tool.name,
+        ...(tool.categoryHint !== undefined ? { categoryHint: tool.categoryHint } : {}),
+      });
     };
     /**
      * One pre-dispatch refusal: the call fact on the generic lane, then the
@@ -1055,10 +1231,12 @@ export class ToolRuntime {
       text: string,
       sandboxFailure?: Extract<ToolResultContent, { kind: 'text' }>['sandboxFailure'],
     ): Promise<void> => {
-      pushCallEvent('preflight');
+      publishCallEvent(buildCallEvent('preflight'));
+      emitToolStartedTrace();
       await this.writeSyntheticToolResult(
         toolUseId,
         turnId,
+        tool.name,
         text,
         queue,
         undefined,
@@ -1067,29 +1245,6 @@ export class ToolRuntime {
         activityIdentity,
       );
     };
-    const callMsg: ToolCallMessage = {
-      type: 'tool_call',
-      id: toolUseId,
-      turnId,
-      ts: now,
-      toolName: tool.name,
-      ...activityIdentity,
-      ...(tool.activityKind ? { activityKind: tool.activityKind } : {}),
-      ...(tool.displayName ? { displayName: tool.displayName } : {}),
-      args: structuredClone(persistedArgs),
-      ...(ctx.providerOptions !== undefined
-        ? { providerOptions: structuredClone(ctx.providerOptions) }
-        : {}),
-      // Persist the same step id the tool_start event carries so the UI
-      // timeline and post-restart backfill can pair this call with its step.
-      ...(stepId !== undefined ? { stepId } : {}),
-    };
-    await this.input.appendMessage(callMsg);
-    trace?.emit('tool', 'tool_started', 'Tool execution started', {
-      toolUseId,
-      toolName: tool.name,
-      ...(tool.categoryHint !== undefined ? { categoryHint: tool.categoryHint } : {}),
-    });
     if (admissionFailure) {
       const boundaryKind = boundaryAuthorityAttempt ? ('invalid' as const) : undefined;
       if (boundaryKind) {
@@ -1246,9 +1401,12 @@ export class ToolRuntime {
     }
 
     let clientCapabilityBoundary: ExecutionBoundary | undefined;
-    if (tool.categoryHint === 'client_capability') {
+    let clientCapabilityPermissionMode: PermissionMode | undefined;
+    let preparedExecution: PreparedMakaToolExecution | undefined;
+    if (tool.hostAdmission === 'client_capability') {
       try {
         clientCapabilityBoundary = await this.readExecutionBoundary();
+        clientCapabilityPermissionMode = await this.livePermissionMode(clientCapabilityBoundary);
       } catch (error) {
         const reason = formatSyntheticToolErrorText(error);
         await refuseBeforeDispatch(reason);
@@ -1261,8 +1419,13 @@ export class ToolRuntime {
         this.recordLoopGateOutcome(callSignature, true);
         return this.errorReturn(reason);
       }
-      if (clientCapabilityBoundary.kind !== 'bypass') {
-        await refuseBeforeDispatch(CLIENT_CAPABILITY_BOUNDARY_MESSAGE, {
+      const admissionFailure = !tool.prepareExecution
+        ? CLIENT_CAPABILITY_PREPARATION_MESSAGE
+        : clientCapabilityBoundary.kind !== 'bypass' && clientCapabilityPermissionMode !== 'ask'
+          ? CLIENT_CAPABILITY_BOUNDARY_MESSAGE
+          : undefined;
+      if (admissionFailure) {
+        await refuseBeforeDispatch(admissionFailure, {
           reason: 'requires_bypass',
           source: 'client_capability',
         });
@@ -1273,12 +1436,43 @@ export class ToolRuntime {
           errorClass: 'ClientCapabilityBoundary',
         });
         this.recordLoopGateOutcome(callSignature, true);
-        return this.errorReturn(CLIENT_CAPABILITY_BOUNDARY_MESSAGE);
+        return this.errorReturn(admissionFailure);
+      }
+      // Narrowed by admissionFailure above; Bypass still prepares so the
+      // provider cannot regain a direct pre-T1 dispatch path.
+      const prepareExecution = tool.prepareExecution!;
+      const pauseTarget = this.input.getPermissionPauseTarget();
+      pauseTarget?.pause();
+      try {
+        preparedExecution = await prepareExecution(structuredClone(executionArgs) as never, {
+          sessionId: this.input.sessionId,
+          turnId,
+          ...(runId ? { runId } : {}),
+          cwd: this.input.header.cwd,
+          executionBoundary: clientCapabilityBoundary,
+          permissionMode: clientCapabilityPermissionMode,
+          toolCallId: toolUseId,
+          abortSignal: ctx.abortSignal,
+        });
+      } catch (error) {
+        const reason = formatSyntheticToolErrorText(error);
+        await refuseBeforeDispatch(reason);
+        trace?.emit('tool', 'tool_failed', 'Client Capability preparation failed', {
+          toolUseId,
+          toolName: tool.name,
+          status: 'error',
+          errorClass: 'ClientCapabilityPreparation',
+        });
+        this.recordLoopGateOutcome(callSignature, true);
+        return this.errorReturn(reason);
+      } finally {
+        pauseTarget?.resume();
       }
     }
 
     const reservedSubagentSlot = this.reserveSubagentSlot(tool);
     if (!reservedSubagentSlot) {
+      await preparedExecution?.cancel();
       trace?.emit('tool', 'tool_failed', 'Tool execution rejected by runtime limit', {
         toolUseId,
         toolName: tool.name,
@@ -1294,17 +1488,19 @@ export class ToolRuntime {
     try {
       durableAttempt = await this.prepareDurableToolAttempt({
         tool,
-        startEvent: pushCallEvent('dispatch'),
+        startEvent: buildCallEvent('dispatch'),
         persistedArgs,
-        modelFacingArgs,
         abortSignal: ctx.abortSignal,
         ...(invocationId ? { invocationId } : {}),
         ...(runId ? { runId } : {}),
       });
     } catch (error) {
+      await preparedExecution?.cancel();
       if (reservedSubagentSlot) this.releaseSubagentSlot(tool);
       throw error;
     }
+    publishCallEvent(buildCallEvent('dispatch'));
+    emitToolStartedTrace();
     if (durableAttempt) {
       this.durableToolAttempts.set(durableAttemptKey(turnId, toolUseId), durableAttempt);
     }
@@ -1339,7 +1535,9 @@ export class ToolRuntime {
       try {
         const runId = this.input.runId;
         const executionBoundary = clientCapabilityBoundary ?? (await this.readExecutionBoundary());
-        const result = await tool.impl(structuredClone(executionArgs) as never, {
+        const permissionMode =
+          clientCapabilityPermissionMode ?? (await this.livePermissionMode(executionBoundary));
+        const toolContext: MakaToolContext = {
           sessionId: this.input.sessionId,
           turnId,
           ...(runId ? { runId } : {}),
@@ -1348,11 +1546,11 @@ export class ToolRuntime {
             : {}),
           cwd: this.input.header.cwd,
           executionBoundary,
-          permissionMode: this.input.header.permissionMode,
+          permissionMode,
           toolCallId: toolUseId,
           // The id the call event actually carries, not the candidate: by here
           // `prepareDurableToolAttempt` has pushed it on the dispatch lane.
-          ...(pushedCallEvent?.operationId ? { operationId: pushedCallEvent.operationId } : {}),
+          ...(callEvent?.operationId ? { operationId: callEvent.operationId } : {}),
           abortSignal: ctx.abortSignal,
           emitOutput: output.emit,
           emitProgress: (current, total) => {
@@ -1404,6 +1602,15 @@ export class ToolRuntime {
           }),
           askUserQuestion: (questions) =>
             this.askUserQuestion(turnId, toolUseId, questions, ctx.abortSignal, queue),
+          requestUserForm: (form, options) =>
+            this.requestUserForm(
+              turnId,
+              toolUseId,
+              form,
+              ctx.abortSignal,
+              queue,
+              options?.cancellationSignal,
+            ),
           requestSandboxBoundary: (expansion, justification) =>
             this.requestSandboxBoundary(
               turnId,
@@ -1413,23 +1620,49 @@ export class ToolRuntime {
               ctx.abortSignal,
               queue,
             ),
-        });
-        if (
-          ctx.maxResultBytes !== undefined &&
-          serializedByteLength(result, ctx.maxResultBytes) > ctx.maxResultBytes
-        ) {
-          throw new ToolResultLimitError();
-        }
+        };
+        const invokeTool = () =>
+          preparedExecution
+            ? preparedExecution.execute(toolContext)
+            : tool.impl(structuredClone(executionArgs) as never, toolContext);
+        const prepareOperationValue = async () => {
+          const result = await invokeTool();
+          if (
+            ctx.maxResultBytes !== undefined &&
+            serializedByteLength(result, ctx.maxResultBytes) > ctx.maxResultBytes
+          ) {
+            throw new ToolResultLimitError();
+          }
+          const content = coerceResultContent(result);
+          const projected = this.projectToolResult(tool, turnId, toolUseId, executionArgs, result);
+          const modelProjection = isPromiseLike(projected) ? await projected : projected;
+          return {
+            result,
+            content,
+            isError: deriveToolResultStatus(content, result) !== 'success',
+            durationMs: this.input.now() - startedAt,
+            modelProjection,
+          };
+        };
+        const { result, content, isError, durationMs, modelProjection } =
+          await prepareOperationValue();
         output.flush();
-        const durationMs = this.input.now() - startedAt;
-
-        const content = coerceResultContent(result);
+        // Keep the full provider-facing terminal classification. `isError` is
+        // sufficient for the durable response envelope, but it intentionally
+        // collapses `aborted` into an error bit and therefore cannot drive live
+        // tool status, telemetry, or subagent lifecycle projection.
         const toolResultStatus = deriveToolResultStatus(content, result);
-        const durableOutcome = await durableAttempt?.commitOutcome(
+        await this.commitAndPublishToolResult({
+          queue,
+          turnId,
+          toolUseId,
+          isError,
           content,
-          toolResultStatus !== 'success',
+          modelProjection,
           durationMs,
-        );
+          activityIdentity,
+          durableAttempt,
+        });
         if (hasSandboxDenial(content)) {
           const denialKey = sandboxDenialKey(tool.name, this.input.header.cwd, executionArgs);
           this.recentSandboxDenials.add(denialKey);
@@ -1451,31 +1684,6 @@ export class ToolRuntime {
             },
           );
         }
-        const resultMsg: ToolResultMessage = {
-          type: 'tool_result',
-          id: this.input.newId(),
-          turnId,
-          ts: this.input.now(),
-          toolUseId,
-          isError: toolResultStatus !== 'success',
-          content,
-          durationMs,
-          ...activityIdentity,
-        };
-        await this.input.appendMessage(resultMsg);
-        queue.push({
-          type: 'tool_result',
-          id: durableOutcome?.id ?? this.input.newId(),
-          turnId,
-          ts: durableOutcome?.ts ?? this.input.now(),
-          toolUseId,
-          ...(durableOutcome ? { operationId: durableOutcome.operationId } : {}),
-          isError: toolResultStatus !== 'success',
-          content,
-          durationMs,
-          ...activityIdentity,
-        } satisfies ToolResultEvent);
-
         this.input.recordToolInvocation?.({
           sessionId: this.input.sessionId,
           turnId,
@@ -1574,35 +1782,26 @@ export class ToolRuntime {
           );
         }
         const durationMs = Math.max(0, this.input.now() - startedAt);
-        const durableOutcome = await durableAttempt?.commitOutcome(
+        const terminalResult = this.errorReturn(terminalFailure.message);
+        const projected = this.projectToolResult(
+          tool,
+          turnId,
+          toolUseId,
+          executionArgs,
           terminalFailure.content,
-          true,
-          durationMs,
         );
-        const resultMsg: ToolResultMessage = {
-          type: 'tool_result',
-          id: this.input.newId(),
+        const modelProjection = isPromiseLike(projected) ? await projected : projected;
+        await this.commitAndPublishToolResult({
+          queue,
           turnId,
-          ts: this.input.now(),
           toolUseId,
           isError: true,
           content: terminalFailure.content,
+          modelProjection,
           durationMs,
-          ...activityIdentity,
-        };
-        await this.input.appendMessage(resultMsg);
-        queue.push({
-          type: 'tool_result',
-          id: durableOutcome?.id ?? this.input.newId(),
-          turnId,
-          ts: durableOutcome?.ts ?? this.input.now(),
-          toolUseId,
-          ...(durableOutcome ? { operationId: durableOutcome.operationId } : {}),
-          isError: true,
-          content: terminalFailure.content,
-          durationMs,
-          ...activityIdentity,
-        } satisfies ToolResultEvent);
+          activityIdentity,
+          durableAttempt,
+        });
         this.input.recordToolInvocation?.({
           sessionId: this.input.sessionId,
           turnId,
@@ -1630,7 +1829,7 @@ export class ToolRuntime {
           errorClass,
           ...(sandboxError ? { sandbox: sandboxError } : {}),
         });
-        return this.errorReturn(terminalFailure.message);
+        return terminalResult;
       }
       const msg =
         err instanceof ToolResultLimitError
@@ -1643,6 +1842,7 @@ export class ToolRuntime {
       await this.writeSyntheticToolResult(
         toolUseId,
         turnId,
+        tool.name,
         msg,
         queue,
         sandboxDenialSignalFromError(err),
@@ -1693,8 +1893,6 @@ export class ToolRuntime {
     tool: MakaTool;
     startEvent: ToolStartEvent;
     persistedArgs: unknown;
-    /** The projection the model replays as its own call. */
-    modelFacingArgs: unknown;
     abortSignal: AbortSignal;
     invocationId?: string;
     runId?: string;
@@ -1740,7 +1938,7 @@ export class ToolRuntime {
         kind: 'function_call',
         id: input.startEvent.toolUseId,
         name: input.tool.name,
-        args: structuredClone(input.modelFacingArgs),
+        args: structuredClone(input.persistedArgs),
         ...(input.startEvent.providerOptions !== undefined
           ? { providerOptions: structuredClone(input.startEvent.providerOptions) }
           : {}),
@@ -1775,6 +1973,7 @@ export class ToolRuntime {
       actions: {
         toolDispatch: {
           protocol: TOOL_BOUNDARY_PROTOCOL_V1,
+          resultProjectionVersion: 1,
           operationId,
           providerToolCallId: input.startEvent.toolUseId,
           toolName: input.tool.name,
@@ -1812,43 +2011,56 @@ export class ToolRuntime {
     } catch (error) {
       throw new RuntimeCommitBoundaryError('T1', error);
     }
+    const buildResponseEvent = (
+      result: unknown,
+      isError: boolean,
+      modelProjection: DurableToolResultProjection,
+      durationMs: number | undefined,
+      ts: number,
+    ): RuntimeEvent => ({
+      id: `${operationId}_response`,
+      invocationId,
+      runId,
+      sessionId: this.input.sessionId,
+      turnId: input.startEvent.turnId,
+      ts,
+      partial: false,
+      role: 'tool',
+      author: 'tool',
+      origin: input.startEvent.origin ?? 'provider',
+      modelVisibility: input.startEvent.modelVisibility ?? 'visible',
+      content: {
+        kind: 'function_response',
+        id: input.startEvent.toolUseId,
+        name: input.tool.name,
+        result,
+        ...(isError ? { isError: true } : {}),
+        modelProjection,
+      },
+      refs: {
+        operationId,
+        toolCallId: input.startEvent.toolUseId,
+        ...(input.startEvent.parentToolCallId
+          ? { parentToolCallId: input.startEvent.parentToolCallId }
+          : {}),
+        ...(input.startEvent.parentOperationId
+          ? { parentOperationId: input.startEvent.parentOperationId }
+          : {}),
+      },
+      ...(durationMs !== undefined ? { actions: { stateDelta: { durationMs } } } : {}),
+    });
     let committedOutcome: { id: string; operationId: string; ts: number } | undefined;
     return {
       operationId,
-      responseEventId: `${operationId}_response`,
-      commitOutcome: async (result, isError, durationMs) => {
+      commitOutcome: async (result, isError, modelProjection, durationMs) => {
         if (committedOutcome) return committedOutcome;
-        const responseEvent: RuntimeEvent = {
-          id: `${operationId}_response`,
-          invocationId,
-          runId,
-          sessionId: this.input.sessionId,
-          turnId: input.startEvent.turnId,
-          ts: this.input.now(),
-          partial: false,
-          role: 'tool',
-          author: 'tool',
-          origin: input.startEvent.origin ?? 'provider',
-          modelVisibility: input.startEvent.modelVisibility ?? 'visible',
-          content: {
-            kind: 'function_response',
-            id: input.startEvent.toolUseId,
-            name: input.tool.name,
-            result,
-            ...(isError ? { isError: true } : {}),
-          },
-          refs: {
-            operationId,
-            toolCallId: input.startEvent.toolUseId,
-            ...(input.startEvent.parentToolCallId
-              ? { parentToolCallId: input.startEvent.parentToolCallId }
-              : {}),
-            ...(input.startEvent.parentOperationId
-              ? { parentOperationId: input.startEvent.parentOperationId }
-              : {}),
-          },
-          ...(durationMs !== undefined ? { actions: { stateDelta: { durationMs } } } : {}),
-        };
+        const responseEvent = buildResponseEvent(
+          result,
+          isError,
+          modelProjection,
+          durationMs,
+          this.input.now(),
+        );
         try {
           await sink.commitToolOutcome({
             operationId,
@@ -1857,6 +2069,17 @@ export class ToolRuntime {
             committedAt: responseEvent.ts,
           });
         } catch (error) {
+          try {
+            await input.tool.compensateDurableOutcomeCommitFailure?.({
+              result,
+              isError,
+              sessionId: this.input.sessionId,
+              operationId,
+            });
+          } catch {
+            // T2 remains authoritative. Compensation is deliberately best-effort
+            // and must never replace the persistence failure that triggered it.
+          }
           throw new RuntimeCommitBoundaryError('T2', error);
         }
         committedOutcome = {
@@ -2030,6 +2253,7 @@ export class ToolRuntime {
                     toolCallId: input.toolUseId,
                     agentProfile: spawnInput.agentProfile,
                     ...(spawnInput.subagentId ? { subagentId: spawnInput.subagentId } : {}),
+                    ...(spawnInput.executorId ? { executorId: spawnInput.executorId } : {}),
                     prompt: spawnInput.prompt,
                     ...(spawnInput.swarm ? { swarm: spawnInput.swarm } : {}),
                     abortSignal,
@@ -2064,6 +2288,127 @@ export class ToolRuntime {
           }
         : {}),
     };
+  }
+
+  private async requestUserForm(
+    turnId: string,
+    toolUseId: string,
+    form: InteractionFormInput,
+    abortSignal: AbortSignal,
+    queue: DurableSessionEventSink,
+    producerCancellationSignal?: AbortSignal,
+  ): Promise<InteractionFormResult> {
+    const interactionSignal = composeChildAbortSignal(abortSignal, producerCancellationSignal);
+    throwIfAborted(interactionSignal);
+    const hostedRun = this.interactionRun();
+    const requestId = this.input.newId();
+    const request = projectInteractionFormRequest({ toolUseId, ...form });
+    const parked = this.userForms.park(requestId, {
+      toolUseId,
+      request,
+      hosted: hostedRun !== undefined,
+    });
+    const onAbort = (): void => {
+      if (hostedRun) return;
+      this.userForms.reject(requestId, abortErrorFromSignal(abortSignal));
+      this.finishDeferredFormTurnClosure();
+    };
+    let hostedAdmission: Promise<void> | undefined;
+    let producerWithdrawal: Promise<void> | undefined;
+    const onProducerCancellation = (): void => {
+      if (abortSignal.aborted) return;
+      if (hostedRun) {
+        producerWithdrawal ??= Promise.resolve().then(async () => {
+          try {
+            await hostedAdmission;
+          } catch {
+            return;
+          }
+          await hostedRun.withdrawFormRequest(requestId);
+        });
+      } else if (producerCancellationSignal) {
+        this.userForms.reject(requestId, abortErrorFromSignal(producerCancellationSignal));
+        this.finishDeferredFormTurnClosure();
+      }
+    };
+    abortSignal.addEventListener('abort', onAbort, { once: true });
+    producerCancellationSignal?.addEventListener('abort', onProducerCancellation, { once: true });
+    if (hostedRun) void parked.catch(() => undefined);
+    try {
+      const requestEvent: FormRequestEvent = {
+        type: 'form_request',
+        id: this.input.newId(),
+        turnId,
+        ts: this.input.now(),
+        requestId,
+        toolUseId,
+        message: request.message,
+        requester: request.requester,
+        fields: request.fields,
+      };
+      if (hostedRun) {
+        const settlement = this.createFormSettlement(turnId, requestId);
+        const admission = Promise.resolve().then(() =>
+          hostedRun.admitFormRequest({ request: requestEvent, settlement }),
+        );
+        hostedAdmission = admission;
+        try {
+          await racePromiseWithAbort(admission, interactionSignal);
+        } catch (error) {
+          if (interactionSignal.aborted) {
+            void admission.catch((admissionError) => {
+              this.userForms.reject(
+                requestId,
+                admissionError instanceof Error
+                  ? admissionError
+                  : new RuntimeInteractionFailStopError(
+                      `Could not confirm admission for form ${requestId}`,
+                      admissionError,
+                    ),
+              );
+              this.finishDeferredFormTurnClosure();
+            });
+            throw abortErrorFromSignal(interactionSignal);
+          }
+          this.userForms.reject(
+            requestId,
+            error instanceof Error
+              ? error
+              : new RuntimeInteractionFailStopError(
+                  `Could not confirm admission for form ${requestId}`,
+                  error,
+                ),
+          );
+          this.finishDeferredFormTurnClosure();
+          await parked.catch(() => undefined);
+          throw interactionAuthorityError(
+            `Could not confirm admission for form ${requestId}`,
+            error,
+          );
+        }
+      }
+      throwIfAborted(interactionSignal);
+      queue.push(requestEvent);
+      const response = await racePromiseWithAbort(parked, interactionSignal);
+      throwIfAborted(interactionSignal);
+      const answerAck: FormAnswerAckEvent = {
+        type: 'form_answer_ack',
+        id: this.input.newId(),
+        turnId,
+        ts: this.input.now(),
+        requestId,
+        toolUseId,
+      };
+      if (hostedRun) await this.publishHostedSettlementAck(queue, answerAck);
+      else queue.push(answerAck);
+      return response.action === 'accept'
+        ? { action: 'accept', values: response.values }
+        : { action: response.action };
+    } finally {
+      abortSignal.removeEventListener('abort', onAbort);
+      producerCancellationSignal?.removeEventListener('abort', onProducerCancellation);
+      if (producerWithdrawal) await producerWithdrawal;
+    }
   }
 
   private async askUserQuestion(
@@ -2312,6 +2657,7 @@ export class ToolRuntime {
             sessionId: this.input.sessionId,
             requestId,
             decision: 'deny',
+            closureReason: 'turn_stopped',
           }).then(() => undefined),
         );
       }
@@ -2441,6 +2787,18 @@ export class ToolRuntime {
     );
   }
 
+  private finishDeferredFormTurnClosure(): void {
+    const turnId = this.turnId;
+    if (!this.formClosureDeferred || this.userForms.pendingCount() !== 0) return;
+    this.formClosureDeferred = false;
+    this.userForms.close(
+      (requestId) =>
+        new RuntimeInteractionInvariantError(
+          `Hosted form ${requestId} escaped exact Run closure for turn ${turnId}`,
+        ),
+    );
+  }
+
   private finishDeferredSandboxBoundaryTurnClosure(): void {
     const turnId = this.turnId;
     if (!this.sandboxBoundaryClosureDeferred || this.sandboxBoundaryRequests.pendingCount() !== 0) {
@@ -2523,6 +2881,37 @@ export class ToolRuntime {
         if (!this.closeUserQuestion(turnId, requestId, reason)) {
           throw new RuntimeInteractionInvariantError(
             `Question closure did not take ${requestId} from turn ${turnId}`,
+          );
+        }
+      },
+    });
+  }
+
+  private createFormSettlement(turnId: string, requestId: string): HostedFormSettlement {
+    return Object.freeze({
+      applyAnswer: async (answer: InteractionFormResult): Promise<void> => {
+        if (Object.hasOwn(answer, 'requestId')) {
+          throw new RuntimeInteractionInvariantError(
+            `Form settlement ${requestId} received a routed answer`,
+          );
+        }
+        const pending = this.userForms
+          .entries()
+          .find(([candidateId]) => candidateId === requestId)?.[1];
+        const response: InteractionFormResponse =
+          answer.action === 'accept'
+            ? { requestId, action: 'accept', values: answer.values }
+            : { requestId, action: answer.action };
+        if (!pending || !this.settleUserFormAnswer(response, pending)) {
+          throw new RuntimeInteractionInvariantError(
+            `Form settlement did not take ${requestId} from turn ${turnId}`,
+          );
+        }
+      },
+      applyClosure: async (reason: RuntimeUserQuestionClosureReason): Promise<void> => {
+        if (!this.closeUserForm(requestId, reason)) {
+          throw new RuntimeInteractionInvariantError(
+            `Form closure did not take ${requestId} from turn ${turnId}`,
           );
         }
       },
@@ -2922,14 +3311,14 @@ function coerceTerminalFailure(
     args && typeof args === 'object' && typeof (args as { command?: unknown }).command === 'string'
       ? (args as { command: string }).command
       : '';
-  const stdout = redactSecrets(String(error.stdout ?? ''));
-  const stderr = redactSecrets(String(error.stderr ?? ''));
+  const stdout = String(error.stdout ?? '');
+  const stderr = String(error.stderr ?? '');
   const sandboxDenied = error.reason === 'sandbox_denial' && error.sandboxed === true;
   return {
     content: {
       kind: 'terminal',
       cwd,
-      cmd: redactSecrets(command),
+      cmd: command,
       status: error.code === 124 ? 'timed_out' : error.code === 130 ? 'cancelled' : 'failed',
       exitCode: error.code,
       output: {
@@ -2938,7 +3327,7 @@ function coerceTerminalFailure(
         stderr,
         stdoutTruncated: error.stdoutTruncated === true,
         stderrTruncated: error.stderrTruncated === true,
-        redacted: stdout !== String(error.stdout ?? '') || stderr !== String(error.stderr ?? ''),
+        redacted: false,
       },
       ...(sandboxDenied
         ? {
@@ -3119,6 +3508,15 @@ function providerToolErrorMessage(output: unknown): string | undefined {
     return record.text;
   }
   return record.error;
+}
+
+function isPromiseLike<T>(value: T | PromiseLike<T>): value is PromiseLike<T> {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    'then' in value &&
+    typeof (value as { then?: unknown }).then === 'function'
+  );
 }
 
 function summarizeArgs(toolName: string, args: unknown): string {
