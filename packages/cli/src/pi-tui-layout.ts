@@ -449,7 +449,17 @@ export class MakaTranscriptScrollView extends ScrollView {
  * needs (#1097, #1134, #4011) must not engage — every entry stays
  * re-renderable and globally toggleable.
  */
-export class MakaFullscreenChromeComponent implements Component {
+export class MakaFullscreenChromeComponent extends Container {
+  /**
+   * Host-owned blocking interaction (the inline user-question prompt). The
+   * fullscreen layout root renders and routes only the mounted tree, so in
+   * fullscreen this chrome owns the role `MakaPiLayoutComponent` owns on the
+   * main screen: it draws the interaction with the same row budgeting (the
+   * editor yields to it, the transcript keeps its minimum row) and mounts it
+   * as a child so input routing reaches it (#4136 review P1).
+   */
+  private blockingInteraction: ViewportAwareComponent | undefined;
+
   constructor(
     private readonly state: MakaPiTranscriptState,
     private readonly activityStrip: MakaActivityStripComponent,
@@ -459,11 +469,19 @@ export class MakaFullscreenChromeComponent implements Component {
     private readonly terminal: Terminal,
     private readonly unreadFeed: UnreadOutputFeed,
     private readonly accent: (text: string) => string,
-  ) {}
+    private readonly todoIndicator?: Component,
+  ) {
+    super();
+  }
 
-  invalidate(): void {}
+  setBlockingInteraction(interaction: ViewportAwareComponent | undefined): void {
+    if (this.blockingInteraction === interaction) return;
+    if (this.blockingInteraction) this.removeChild(this.blockingInteraction);
+    this.blockingInteraction = interaction;
+    if (interaction) this.addChild(interaction);
+  }
 
-  render(width: number): string[] {
+  override render(width: number): string[] {
     const unreadLines = this.unreadFeed.current();
     const indicatorLines = renderUnreadIndicator(unreadLines, this.accent);
     this.unreadFeed.present(unreadLines);
@@ -478,31 +496,62 @@ export class MakaFullscreenChromeComponent implements Component {
     const activityRows = allActivityLines.some((line) => line.length > 0) ? allActivityLines : [];
     const allPendingLines = this.pendingQueue.render(width);
     const statusLines = this.statusLine.render(width);
+    const blockingInteraction = this.blockingInteraction;
+    const interactionMargin = blockingInteraction ? 1 : 0;
+    // Same input selection as MakaPiLayoutComponent: an active blocking
+    // question replaces the composer in the chrome stack.
+    const input = blockingInteraction ?? this.editor;
+    const minimumInputRows = input.minimumViewportRows();
     // Same row account as MakaPiLayoutComponent via budgetEditorAndPendingRows,
-    // with the unread indicator and the transcript's minimum row reserved up
-    // front so the chrome's intrinsic height can never push the transcript
-    // below one row.
-    const editorBudget =
-      this.terminal.rows -
-      indicatorLines.length -
-      activityRows.length -
-      statusLines.length -
+    // with the unread indicator, the Todo row, and the transcript's minimum row
+    // reserved up front so the chrome's intrinsic height can never push the
+    // transcript below one row.
+    const fixedChrome =
+      indicatorLines.length +
+      activityRows.length +
+      statusLines.length +
+      interactionMargin +
       FULLSCREEN_TRANSCRIPT_MIN_ROWS;
-    const { pendingLines, editorRows } = budgetEditorAndPendingRows(
-      editorBudget,
-      allPendingLines,
-      this.editor,
-    );
-    this.editor.setViewportRows(editorRows);
-    const editorLines = this.editor.render(width);
-    // #1064's separator, fullscreen edition: keep "Working… Ns" from touching
+    const todoLines =
+      this.todoIndicator &&
+      this.terminal.rows > fixedChrome + allPendingLines.length + minimumInputRows
+        ? (this.todoIndicator.render(width) ?? []).slice(0, 1)
+        : [];
+    // With a blocking question live, the pending queue yields to the question
+    // (budgeted against the question's minimum rows, as on the main screen)
+    // and the question then takes the remaining rows; without one, the editor
+    // and pending queue split the budget through the shared helper.
+    const { pendingLines, inputRows } = blockingInteraction
+      ? (() => {
+          const questionPending = fitPendingQueueLines(
+            allPendingLines,
+            Math.max(0, this.terminal.rows - fixedChrome - todoLines.length - minimumInputRows),
+          );
+          return {
+            pendingLines: questionPending,
+            inputRows: this.terminal.rows - fixedChrome - todoLines.length - questionPending.length,
+          };
+        })()
+      : (() => {
+          const budgeted = budgetEditorAndPendingRows(
+            this.terminal.rows - fixedChrome - todoLines.length,
+            allPendingLines,
+            this.editor,
+          );
+          return { pendingLines: budgeted.pendingLines, inputRows: budgeted.editorRows };
+        })();
+    input.setViewportRows(inputRows);
+    const inputLines = input.render(width);
+    // #1064's separator, fullscreen edition: keep "Working... Ns" from touching
     // the last visible transcript line when a turn is running.
     return [
       ...indicatorLines,
       ...(activityRows.length > 0 ? [''] : []),
       ...activityRows,
       ...pendingLines,
-      ...editorLines,
+      ...todoLines,
+      ...inputLines,
+      ...(blockingInteraction ? [''] : []),
       ...statusLines,
     ];
   }

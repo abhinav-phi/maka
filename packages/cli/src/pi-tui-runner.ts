@@ -860,6 +860,7 @@ export async function runMakaPiTui(input: MakaPiTuiInput): Promise<void> {
   // (getMountedRoots), so the main layout stays inert in fullscreen.
   const transcriptDocument = new MakaTranscriptDocumentComponent(transcript);
   let transcriptScroll: MakaTranscriptScrollView | undefined;
+  let fullscreenChrome: MakaFullscreenChromeComponent | undefined;
   // Constructed above exactly when the fullscreen trial is on, so this both
   // narrows the TUI type for setLayoutRoot and reads correctly in both arms.
   if (tui instanceof TuiAltScreen) {
@@ -869,7 +870,7 @@ export async function runMakaPiTui(input: MakaPiTuiInput): Promise<void> {
       overscroll: 'chain',
       scrollbar: 'auto',
     });
-    const fullscreenChrome = new MakaFullscreenChromeComponent(
+    fullscreenChrome = new MakaFullscreenChromeComponent(
       state,
       activityStrip,
       pendingQueue,
@@ -883,6 +884,7 @@ export async function runMakaPiTui(input: MakaPiTuiInput): Promise<void> {
         },
       },
       ansi.accent,
+      todoIndicator,
     );
     tui.setLayoutRoot(
       new VStack([
@@ -2353,6 +2355,10 @@ export async function runMakaPiTui(input: MakaPiTuiInput): Promise<void> {
     const prompt = userQuestionPrompt;
     if (!prompt) return;
     layout.setBlockingInteraction(undefined);
+    // In fullscreen the main-screen layout stays inert (the mounted layout
+    // root draws and budgets rows), so the chrome has to detach the question
+    // from the tree that actually renders it.
+    fullscreenChrome?.setBlockingInteraction(undefined);
     userQuestionPrompt = undefined;
     if (tui.getFocusedComponent() === prompt) tui.setFocus(editorSurface);
   };
@@ -2410,6 +2416,10 @@ export async function runMakaPiTui(input: MakaPiTuiInput): Promise<void> {
       onSkip: () => advance(null),
     });
     layout.setBlockingInteraction(userQuestionPrompt);
+    // The fullscreen question must live inside the mounted layout root, or
+    // the focused overlay is never drawn and the turn waits on a blind answer
+    // (#4136 review P1).
+    fullscreenChrome?.setBlockingInteraction(userQuestionPrompt);
     tui.setFocus(userQuestionPrompt);
   };
 
