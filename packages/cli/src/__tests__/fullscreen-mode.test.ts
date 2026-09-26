@@ -104,6 +104,11 @@ function makePendingQueue(
   )(state, 'en');
 }
 
+interface ViewportAwareComponentForChrome extends Component {
+  setViewportRows(rows: number): void;
+  minimumViewportRows(): number;
+}
+
 function snapshot(overrides: Partial<TranscriptWindowSnapshot> = {}): TranscriptWindowSnapshot {
   return { followingEnd: true, documentLines: 10, ...overrides };
 }
@@ -319,6 +324,7 @@ describe('fullscreen layout frame', () => {
     state: ReturnType<typeof createMakaPiTranscriptState>;
     scrollView: MakaTranscriptScrollView;
     document: MakaTranscriptDocumentComponent;
+    chrome: MakaFullscreenChromeComponent;
     /** Renders one frame exactly the way TuiAltScreen.doRender does. */
     render(): ReturnType<typeof renderLayoutFrame>;
     /** Plain-text lines of a freshly rendered frame. */
@@ -333,7 +339,7 @@ describe('fullscreen layout frame', () => {
     documentLines(): number;
   }
 
-  function build(): FrameHarness {
+  function build(rows: number = ROWS): FrameHarness {
     const state = createMakaPiTranscriptState();
     const metadata = () => ({
       title: 'Maka',
@@ -357,7 +363,7 @@ describe('fullscreen layout frame', () => {
       makePendingQueue(state),
       editor,
       new MakaStatusLineComponent(metadata),
-      fakeTerminal(ROWS),
+      fakeTerminal(rows),
       {
         current: () => scrollView.computedUnread,
         present: (unreadLines) => {
@@ -374,13 +380,14 @@ describe('fullscreen layout frame', () => {
       state,
       scrollView,
       document,
+      chrome,
       frameCatchUps: 0,
       render: () => {
         // Count only requests raised inside this frame's layout walk — the
         // unread convergence. Scroll gestures between frames also fire
         // pi-tui's persisted request callback; those are not catch-ups.
         let inFrame = 0;
-        const frame = renderLayoutFrame(root, 80, ROWS, () => {
+        const frame = renderLayoutFrame(root, 80, rows, () => {
           inFrame += 1;
         });
         harness.frameCatchUps = inFrame;
@@ -400,6 +407,80 @@ describe('fullscreen layout frame', () => {
     };
     return harness;
   }
+
+  /** A 3-option blocking question shaped like the production overlay. */
+  function fakeQuestion(): ViewportAwareComponentForChrome {
+    let viewportRows = 6;
+    return {
+      invalidate() {},
+      render(): string[] {
+        return [
+          'Choose an approach (1 of 3)',
+          '  Extend',
+          '  Separate',
+          '→ Other: type your answer',
+          '────────',
+        ].slice(0, Math.max(1, viewportRows));
+      },
+      setViewportRows(rows: number): void {
+        viewportRows = Math.max(this.minimumViewportRows(), Math.floor(rows));
+      },
+      minimumViewportRows(): number {
+        return 6;
+      },
+    };
+  }
+
+  test('a live unread banner never crowds out a question or the status line on a short screen (#4136 review P2)', () => {
+    // Exact review repro: user scrolled away, output accumulated (unread
+    // banner), then the Host asks a three-option question. At the repository's
+    // 8-row fullscreen boundary the banner + margin + clamped question emitted
+    // two rows more than the chrome's allocation and the status line clipped
+    // off the bottom; the banner yields before the question ever does.
+    const harness = build(8);
+    harness.addEntries(40);
+    harness.render();
+    harness.scrollView.scrollBy(-6);
+    harness.addEntries(5);
+    harness.render();
+    harness.render(); // converge the unread catch-up
+    assert.ok(harness.scrollView.computedUnread > 0, 'expected an unread count');
+    const question = fakeQuestion();
+    harness.chrome.setBlockingInteraction(question);
+    try {
+      const lines = harness.plainLines();
+      const joined = lines.join('\n');
+      assert.equal(lines.length, 8);
+      assert.ok(joined.includes('Choose an approach'), 'the question stays visible');
+      assert.ok(joined.includes('Other: type your answer'), 'the answer field stays usable');
+      assert.match(
+        lines.at(-1) ?? '',
+        /claude-sonnet-4-5/,
+        'the status line holds the last screen row',
+      );
+      // The unread banner is what yields: information after load-bearing chrome.
+      assert.ok(!joined.includes('new lines'), 'the unread banner yields to the question');
+    } finally {
+      harness.chrome.setBlockingInteraction(undefined);
+    }
+    // A slightly taller screen fits everything: the banner stays up.
+    const tall = build(10);
+    tall.addEntries(40);
+    tall.render();
+    tall.scrollView.scrollBy(-6);
+    tall.addEntries(5);
+    tall.render();
+    tall.render();
+    tall.chrome.setBlockingInteraction(question);
+    try {
+      const lines = tall.plainLines();
+      const joined = lines.join('\n');
+      assert.ok(joined.includes('new lines'), 'the banner survives with room to spare');
+      assert.match(lines.at(-1) ?? '', /claude-sonnet-4-5/);
+    } finally {
+      tall.chrome.setBlockingInteraction(undefined);
+    }
+  });
 
   test('keeps the composer anchored at the bottom of the viewport', () => {
     const harness = build();

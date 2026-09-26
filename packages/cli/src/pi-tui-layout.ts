@@ -503,7 +503,6 @@ export class MakaFullscreenChromeComponent extends Container {
     const allPendingLines = this.pendingQueue.render(width);
     const statusLines = this.statusLine.render(width);
     const blockingInteraction = this.blockingInteraction;
-    const interactionMargin = blockingInteraction ? 1 : 0;
     // Same input selection as MakaPiLayoutComponent: an active blocking
     // question replaces the composer in the chrome stack.
     const input = blockingInteraction ?? this.editor;
@@ -513,12 +512,13 @@ export class MakaFullscreenChromeComponent extends Container {
     // the transcript's minimum row reserved up front so the chrome's intrinsic
     // height can never push the transcript below one row or overflow the
     // allocation the VStack gives it.
+    let effectiveMargin = blockingInteraction ? 1 : 0;
     const fixedChrome =
       indicatorLines.length +
       activitySeparator.length +
       activityRows.length +
       statusLines.length +
-      interactionMargin +
+      effectiveMargin +
       FULLSCREEN_TRANSCRIPT_MIN_ROWS;
     const todoLines =
       this.todoIndicator &&
@@ -552,28 +552,56 @@ export class MakaFullscreenChromeComponent extends Container {
     let effectiveFixedChrome = fixedChrome;
     let effectiveSeparator = activitySeparator;
     let effectiveActivityRows = activityRows;
+    let effectiveIndicator = indicatorLines;
     let { pendingLines, inputRows } = budgetChrome(effectiveFixedChrome);
     // Squeeze rule (#4136 review P2): if the remaining budget cannot even give
-    // the input its own minimum, the live activity strip and its separator
-    // yield before anything else does. The overlay/editor clamps to its
-    // minimum and the extra rows would overflow the chrome's VStack
-    // allocation, clipping the status line off the bottom of the screen.
-    if (inputRows < minimumInputRows && effectiveActivityRows.length > 0) {
-      effectiveFixedChrome -= effectiveSeparator.length + effectiveActivityRows.length;
-      effectiveSeparator = [];
-      effectiveActivityRows = [];
+    // the input its own minimum, the input is load-bearing and clamps to that
+    // minimum, so decorative chrome rows yield in priority order until the
+    // frame fits the chrome's VStack allocation: the live activity strip and
+    // its separator first, then the question's blank margin row (pure
+    // decoration), and only as a last resort the unread banner — information
+    // yields after decoration. A user scrolled away can catch up after
+    // answering; a clipped status line or an unreachable answer field cannot.
+    // The second round of this review caught the residual case at the 8-row
+    // boundary: an unread banner plus a three-option question still pushed the
+    // chrome two rows past its allocation because only the strip yielded.
+    const yielders: Array<() => number> = [
+      () => {
+        const drop = effectiveSeparator.length + effectiveActivityRows.length;
+        if (drop === 0) return 0;
+        effectiveSeparator = [];
+        effectiveActivityRows = [];
+        return drop;
+      },
+      () => {
+        if (effectiveMargin === 0) return 0;
+        effectiveMargin = 0;
+        return 1;
+      },
+      () => {
+        const drop = effectiveIndicator.length;
+        if (drop === 0) return 0;
+        effectiveIndicator = [];
+        return drop;
+      },
+    ];
+    for (const yieldRows of yielders) {
+      if (inputRows >= minimumInputRows) break;
+      const dropped = yieldRows();
+      if (dropped === 0) continue;
+      effectiveFixedChrome -= dropped;
       ({ pendingLines, inputRows } = budgetChrome(effectiveFixedChrome));
     }
     input.setViewportRows(inputRows);
     const inputLines = input.render(width);
     return [
-      ...indicatorLines,
+      ...effectiveIndicator,
       ...effectiveSeparator,
       ...effectiveActivityRows,
       ...pendingLines,
       ...todoLines,
       ...inputLines,
-      ...(blockingInteraction ? [''] : []),
+      ...(effectiveMargin > 0 ? [''] : []),
       ...statusLines,
     ];
   }
