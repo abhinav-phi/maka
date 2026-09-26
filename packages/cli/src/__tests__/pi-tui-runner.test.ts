@@ -13413,6 +13413,68 @@ describe('fullscreen TUI trial (#4136)', () => {
     ]);
   });
 
+  test('keeps the status line and a usable answer input for a live question on a 10-row terminal (#4136 review P2)', async () => {
+    // The row account must include the live-activity separator: a Host
+    // question is raised while the Turn is still running, so the activity
+    // strip and its blank separator are chrome rows that squeeze the
+    // remaining budget. On a 10-row fullscreen terminal the separator row
+    // pushed the chrome one row past its VStack allocation and clipped the
+    // status line off the bottom of the screen. The strip yields before the
+    // question's minimum viewport does.
+    const terminal = new FakeTerminal(80, 10);
+    const driver = new UserQuestionPromptDriver();
+    const run = runMakaPiTui({
+      title: 'Maka',
+      driver,
+      cwd: '/repo',
+      model: 'claude-sonnet-4-5',
+      connectionSlug: 'claude-subscription',
+      permissionMode: 'ask',
+      terminal,
+      tuiFullscreen: true,
+    });
+
+    terminal.input('choose');
+    terminal.input('\r');
+    await waitFor(() =>
+      plainTerminalOutput(terminal.screenOutput()).includes('Choose an approach'),
+    );
+    // The question is visible with its answer affordances: option rows and
+    // the free-text Other row are on screen, and the status line survived at
+    // the bottom of the screen — the regression clipped it away.
+    const lines = screenLines(terminal);
+    const joined = lines.join('\n');
+    assert.ok(joined.includes('Choose an approach'));
+    assert.ok(joined.includes('Extend'));
+    assert.ok(joined.includes('Other: type your answer'));
+    assert.match(lines.at(-1) ?? '', /claude-sonnet-4-5/);
+    // The live turn may still show its Working strip — but never at the cost
+    // of the question being answerable or the status line visible.
+    // Q1 answered through the option path: Enter picks the highlighted row.
+    terminal.input('\r');
+    await waitFor(() => plainTerminalOutput(terminal.screenOutput()).includes('Keep the default'));
+    terminal.input('\x1b');
+    await waitFor(() => plainTerminalOutput(terminal.screenOutput()).includes('Anything else'));
+    terminal.input('Short');
+    await waitFor(() => plainTerminalOutput(terminal.screenOutput()).includes('Short'));
+    terminal.input('\r');
+    await waitFor(() => driver.responses.length === 1);
+    assert.deepEqual(driver.responses, [
+      {
+        requestId: 'question-1',
+        answers: ['Extend', null, 'Short'],
+      },
+    ]);
+
+    exitMaka(terminal);
+    await Promise.race([
+      run,
+      delay(CLOSE_BUDGET_MS).then(() => {
+        throw new Error('TUI did not close during test cleanup');
+      }),
+    ]);
+  });
+
   test('renders the live Todo indicator in the mounted fullscreen chrome (#4136 review P1)', async () => {
     const terminal = new FakeTerminal(80, 24);
     const driver = Object.assign(new SlashCommandDriver(), {

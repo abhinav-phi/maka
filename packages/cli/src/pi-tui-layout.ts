@@ -494,6 +494,12 @@ export class MakaFullscreenChromeComponent extends Container {
     // an all-empty strip would burn a permanent chrome row between the
     // transcript and the editor, so it collapses to nothing when idle.
     const activityRows = allActivityLines.some((line) => line.length > 0) ? allActivityLines : [];
+    // #1064's separator, fullscreen edition: keep "Working... Ns" from
+    // touching the last visible transcript line when a turn is running. This
+    // row is part of the chrome's emitted height, so the budget must count it
+    // too — otherwise the VStack clips the chrome's bottom (the status line)
+    // on short terminals while a Host question is live (#4136 review P2).
+    const activitySeparator = activityRows.length > 0 ? [''] : [];
     const allPendingLines = this.pendingQueue.render(width);
     const statusLines = this.statusLine.render(width);
     const blockingInteraction = this.blockingInteraction;
@@ -503,11 +509,13 @@ export class MakaFullscreenChromeComponent extends Container {
     const input = blockingInteraction ?? this.editor;
     const minimumInputRows = input.minimumViewportRows();
     // Same row account as MakaPiLayoutComponent via budgetEditorAndPendingRows,
-    // with the unread indicator, the Todo row, and the transcript's minimum row
-    // reserved up front so the chrome's intrinsic height can never push the
-    // transcript below one row.
+    // with the unread indicator, the live-activity separator, the Todo row, and
+    // the transcript's minimum row reserved up front so the chrome's intrinsic
+    // height can never push the transcript below one row or overflow the
+    // allocation the VStack gives it.
     const fixedChrome =
       indicatorLines.length +
+      activitySeparator.length +
       activityRows.length +
       statusLines.length +
       interactionMargin +
@@ -521,33 +529,47 @@ export class MakaFullscreenChromeComponent extends Container {
     // (budgeted against the question's minimum rows, as on the main screen)
     // and the question then takes the remaining rows; without one, the editor
     // and pending queue split the budget through the shared helper.
-    const { pendingLines, inputRows } = blockingInteraction
-      ? (() => {
-          const questionPending = fitPendingQueueLines(
-            allPendingLines,
-            Math.max(0, this.terminal.rows - fixedChrome - todoLines.length - minimumInputRows),
-          );
-          return {
-            pendingLines: questionPending,
-            inputRows: this.terminal.rows - fixedChrome - todoLines.length - questionPending.length,
-          };
-        })()
-      : (() => {
-          const budgeted = budgetEditorAndPendingRows(
-            this.terminal.rows - fixedChrome - todoLines.length,
-            allPendingLines,
-            this.editor,
-          );
-          return { pendingLines: budgeted.pendingLines, inputRows: budgeted.editorRows };
-        })();
+    const budgetChrome = (fixed: number): { pendingLines: string[]; inputRows: number } =>
+      blockingInteraction
+        ? (() => {
+            const questionPending = fitPendingQueueLines(
+              allPendingLines,
+              Math.max(0, this.terminal.rows - fixed - todoLines.length - minimumInputRows),
+            );
+            return {
+              pendingLines: questionPending,
+              inputRows: this.terminal.rows - fixed - todoLines.length - questionPending.length,
+            };
+          })()
+        : (() => {
+            const budgeted = budgetEditorAndPendingRows(
+              this.terminal.rows - fixed - todoLines.length,
+              allPendingLines,
+              this.editor,
+            );
+            return { pendingLines: budgeted.pendingLines, inputRows: budgeted.editorRows };
+          })();
+    let effectiveFixedChrome = fixedChrome;
+    let effectiveSeparator = activitySeparator;
+    let effectiveActivityRows = activityRows;
+    let { pendingLines, inputRows } = budgetChrome(effectiveFixedChrome);
+    // Squeeze rule (#4136 review P2): if the remaining budget cannot even give
+    // the input its own minimum, the live activity strip and its separator
+    // yield before anything else does. The overlay/editor clamps to its
+    // minimum and the extra rows would overflow the chrome's VStack
+    // allocation, clipping the status line off the bottom of the screen.
+    if (inputRows < minimumInputRows && effectiveActivityRows.length > 0) {
+      effectiveFixedChrome -= effectiveSeparator.length + effectiveActivityRows.length;
+      effectiveSeparator = [];
+      effectiveActivityRows = [];
+      ({ pendingLines, inputRows } = budgetChrome(effectiveFixedChrome));
+    }
     input.setViewportRows(inputRows);
     const inputLines = input.render(width);
-    // #1064's separator, fullscreen edition: keep "Working... Ns" from touching
-    // the last visible transcript line when a turn is running.
     return [
       ...indicatorLines,
-      ...(activityRows.length > 0 ? [''] : []),
-      ...activityRows,
+      ...effectiveSeparator,
+      ...effectiveActivityRows,
       ...pendingLines,
       ...todoLines,
       ...inputLines,
