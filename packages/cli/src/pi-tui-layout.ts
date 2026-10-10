@@ -65,13 +65,14 @@ export function fitPendingQueueLines(lines: readonly string[], maxRows: number):
 /**
  * The fullscreen chrome's editor/pending-queue row account, isolated in one
  * function so the budget and its consumers cannot drift apart: from the rows
- * available below the transcript, reserve the editor's minimum viewport while
- * the autocomplete is open (the queue trims first), then give the editor
- * whatever remains. `rowsAvailable` is everything already carved out of the
- * terminal rows — the chrome subtracts the status line, activity strip, unread
- * indicator, and the reserved transcript row before calling. The main-screen
- * layout keeps its own (upstream-owned) accounting; its contract is identical,
- * so the two can be unified onto this function after merge.
+ * available below the transcript, reserve the editor's minimum viewport (the
+ * queue trims first), then give the editor whatever remains, never less than
+ * that minimum while any budget is left to reserve it from. `rowsAvailable` is
+ * everything already carved out of the terminal rows — the chrome subtracts the
+ * status line, activity strip, unread indicator, and the reserved transcript row
+ * before calling. The main-screen layout keeps its own (upstream-owned)
+ * accounting; its contract is identical, so the two can be unified onto this
+ * function after merge.
  */
 function budgetEditorAndPendingRows(
   rowsAvailable: number,
@@ -79,11 +80,13 @@ function budgetEditorAndPendingRows(
   editor: ViewportAwareEditor,
 ): { pendingLines: string[]; editorRows: number } {
   const budget = Math.max(0, Math.floor(rowsAvailable));
-  const pendingRowsAvailable = editor.isShowingAutocomplete()
-    ? Math.max(0, budget - editor.minimumViewportRows())
-    : allPendingLines.length;
+  const minimumEditorRows = editor.minimumViewportRows();
+  const pendingRowsAvailable = Math.max(0, budget - minimumEditorRows);
   const pendingLines = fitPendingQueueLines(allPendingLines, pendingRowsAvailable);
-  return { pendingLines, editorRows: Math.max(0, budget - pendingLines.length) };
+  return {
+    pendingLines,
+    editorRows: budget === 0 ? 0 : Math.max(minimumEditorRows, budget - pendingLines.length),
+  };
 }
 
 export class MakaTranscriptComponent implements Component {
@@ -469,6 +472,7 @@ export class MakaFullscreenChromeComponent extends Container {
     private readonly terminal: Terminal,
     private readonly unreadFeed: UnreadOutputFeed,
     private readonly accent: (text: string) => string,
+    private readonly locale: UiLocale,
     private readonly todoIndicator?: Component,
   ) {
     super();
@@ -483,7 +487,7 @@ export class MakaFullscreenChromeComponent extends Container {
 
   override render(width: number): string[] {
     const unreadLines = this.unreadFeed.current();
-    const indicatorLines = renderUnreadIndicator(unreadLines, this.accent);
+    const indicatorLines = renderUnreadIndicator(unreadLines, this.accent, this.locale);
     this.unreadFeed.present(unreadLines);
     // App-owned viewport: no terminal scrollback exists, so expansion toggles
     // may retarget any entry and no entry is ever frozen off-screen.

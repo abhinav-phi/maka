@@ -18,6 +18,13 @@
  */
 
 import { spawn } from 'node:child_process';
+import {
+  defineUiMessageCatalog,
+  formatUiMessage,
+  resolveUiMessageCatalog,
+  type UiLocale,
+} from '@maka/core/ui-locale';
+import { TUI_COPY_RESOURCES } from './tui-copy-catalog.js';
 
 /**
  * Nightly trial switch for the fullscreen (alternate-screen) TUI, issue #4136.
@@ -115,14 +122,30 @@ export class UnreadOutputCounter {
   }
 }
 
+/**
+ * The fullscreen unread/scroll hint, keyed like the sibling pending-queue copy
+ * so the selected TUI locale selects the string. English carries its own
+ * singular/plural forms; `zh-CN` and `zh-TW` have a single CLDR plural category,
+ * so their entries declare only `other` and never mirror the English noun split.
+ */
+interface TuiUnreadIndicatorCopy {
+  readonly hint: string;
+}
+
+const TUI_UNREAD_INDICATOR_COPY = resolveUiMessageCatalog(
+  defineUiMessageCatalog<TuiUnreadIndicatorCopy>()(TUI_COPY_RESOURCES['unread-indicator']),
+);
+
 /** The rendered unread line: accent-colored, one row, empty when nothing is new. */
 export function renderUnreadIndicator(
   unreadLines: number,
   accent: (text: string) => string,
+  locale: UiLocale,
 ): string[] {
   if (unreadLines <= 0) return [];
-  const noun = unreadLines === 1 ? 'line' : 'lines';
-  return [accent(`↓ ${unreadLines} new ${noun} — End to jump to latest`)];
+  return [
+    accent(formatUiMessage(TUI_UNREAD_INDICATOR_COPY[locale].hint, { count: unreadLines }, locale)),
+  ];
 }
 
 /**

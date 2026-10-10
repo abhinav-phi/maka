@@ -884,6 +884,7 @@ export async function runMakaPiTui(input: MakaPiTuiInput): Promise<void> {
         },
       },
       ansi.accent,
+      locale,
       todoIndicator,
     );
     tui.setLayoutRoot(

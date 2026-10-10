@@ -26,6 +26,7 @@ import type { spawn as SpawnFn } from 'node:child_process';
 // the exact composition path the fullscreen trial uses.
 import { renderLayoutFrame } from '@earendil-works/pi-tui/dist/layout.js';
 import { VStack, type Component, type Terminal } from '@earendil-works/pi-tui';
+import { UI_LOCALES, type UiLocale } from '@maka/core/ui-locale';
 import { createMakaPiTranscriptState } from '../pi-transcript.js';
 import {
   MakaActivityStripComponent,
@@ -224,21 +225,51 @@ describe('unread output counter', () => {
 describe('unread indicator rendering', () => {
   test('renders nothing while there is no unread output', () => {
     assert.deepEqual(
-      renderUnreadIndicator(0, (text) => text),
+      renderUnreadIndicator(0, (text) => text, 'en'),
       [],
     );
   });
 
   test('renders a singular hint for one new line', () => {
     assert.deepEqual(
-      renderUnreadIndicator(1, (text) => text),
+      renderUnreadIndicator(1, (text) => text, 'en'),
       ['↓ 1 new line — End to jump to latest'],
     );
   });
 
   test('renders a plural hint and the jump key for more', () => {
-    const [line] = renderUnreadIndicator(14, (text) => text);
+    const [line] = renderUnreadIndicator(14, (text) => text, 'en');
     assert.equal(line, '↓ 14 new lines — End to jump to latest');
+  });
+
+  test('follows the selected TUI locale instead of English (#4136 review P3)', () => {
+    const zhCN = renderUnreadIndicator(14, (text) => text, 'zh-CN').join('');
+    const zhTW = renderUnreadIndicator(14, (text) => text, 'zh-TW').join('');
+    assert.equal(zhCN, '↓ 14 行新输出 · 按 End 跳到最新');
+    assert.equal(zhTW, '↓ 14 行新輸出 · 按 End 跳到最新');
+    assert.doesNotMatch(zhCN, /new lines/, 'zh-CN must not see the English hint');
+    assert.doesNotMatch(zhTW, /new lines/, 'zh-TW must not see the English hint');
+  });
+
+  test('gives Chinese a single form whatever the count (#4136 review P3)', () => {
+    // zh-CN and zh-TW have one CLDR plural category, so the English
+    // line/lines split must not appear in either: 1 and 14 differ only in the
+    // numeral.
+    const one = renderUnreadIndicator(1, (text) => text, 'zh-CN').join('');
+    const many = renderUnreadIndicator(14, (text) => text, 'zh-CN').join('');
+    assert.equal(one.replace('1', '14'), many);
+    assert.doesNotMatch(many, /line/u, 'no English noun in the Chinese hint');
+  });
+
+  test('keeps the arrow glyph and the single-row output for English', () => {
+    for (const locale of UI_LOCALES) {
+      for (const count of [1, 14]) {
+        const lines = renderUnreadIndicator(count, (text) => text, locale);
+        assert.equal(lines.length, 1, `${locale}/${count}: one row`);
+        assert.ok(lines[0]!.startsWith('↓ '), `${locale}/${count}: the arrow glyph is unchanged`);
+        assert.doesNotMatch(lines[0] ?? '', /\n/u, `${locale}/${count}: stays a single row`);
+      }
+    }
   });
 });
 
@@ -247,6 +278,7 @@ describe('fullscreen chrome component', () => {
     rows: number,
     feed: UnreadOutputFeed,
     metadataOverrides: Record<string, unknown> = {},
+    locale: UiLocale = 'en',
   ) {
     const state = createMakaPiTranscriptState();
     const metadata = () => ({
@@ -267,6 +299,7 @@ describe('fullscreen chrome component', () => {
       fakeTerminal(rows),
       feed,
       (text) => text,
+      locale,
     );
     return { state, chrome, editor };
   }
@@ -283,6 +316,23 @@ describe('fullscreen chrome component', () => {
     assert.equal(
       lines.some((line) => line.includes('↓ 10 new lines — End to jump to latest')),
       true,
+    );
+  });
+
+  test('paints the localized unread hint through the chrome instead of English (#4136 review P3)', () => {
+    // The path a user sees: the chrome asks for the indicator, so the locale it
+    // carries has to reach the string rather than leaving it English on screen.
+    const feed = memoryFeed();
+    const { chrome } = buildChrome(24, feed, {}, 'zh-CN');
+    feed.set(10);
+    const lines = chrome.render(80).map((line) => stripAnsi(line));
+    assert.ok(
+      lines.some((line) => line.includes('↓ 10 行新输出 · 按 End 跳到最新')),
+      'the chrome renders the zh-CN catalog string',
+    );
+    assert.ok(
+      !lines.some((line) => /new lines/u.test(line)),
+      'no English hint reaches a zh-CN screen',
     );
   });
 
@@ -325,6 +375,8 @@ describe('fullscreen layout frame', () => {
     scrollView: MakaTranscriptScrollView;
     document: MakaTranscriptDocumentComponent;
     chrome: MakaFullscreenChromeComponent;
+    /** The chrome's composer: carries the autocomplete state and row history. */
+    editor: RecordingEditor;
     /** Renders one frame exactly the way TuiAltScreen.doRender does. */
     render(): ReturnType<typeof renderLayoutFrame>;
     /** Plain-text lines of a freshly rendered frame. */
@@ -339,7 +391,7 @@ describe('fullscreen layout frame', () => {
     documentLines(): number;
   }
 
-  function build(rows: number = ROWS): FrameHarness {
+  function build(rows: number = ROWS, locale: UiLocale = 'en'): FrameHarness {
     const state = createMakaPiTranscriptState();
     const metadata = () => ({
       title: 'Maka',
@@ -371,6 +423,7 @@ describe('fullscreen layout frame', () => {
         },
       },
       (text) => text,
+      locale,
     );
     const root = new VStack([
       { component: scrollView, basis: 0, grow: 1, minSize: 1 },
@@ -381,6 +434,7 @@ describe('fullscreen layout frame', () => {
       scrollView,
       document,
       chrome,
+      editor,
       frameCatchUps: 0,
       render: () => {
         // Count only requests raised inside this frame's layout walk — the
@@ -480,6 +534,46 @@ describe('fullscreen layout frame', () => {
     } finally {
       tall.chrome.setBlockingInteraction(undefined);
     }
+  });
+
+  test('keeps the composer its minimum rows when a long pending queue competes on a short screen (#4136 review P2)', () => {
+    // Exact review repro: the 8-row fullscreen boundary, five queued
+    // steering/follow-up messages, autocomplete closed. The queue emits one row
+    // per message plus its hint row, so five items are six rows; with the
+    // editor's minimum viewport unreserved while the autocomplete was closed the
+    // queue claimed all six available rows, the composer was budgeted zero rows
+    // yet still rendered its own frame, and the chrome's VStack clipped the
+    // status line off the bottom of the screen.
+    const harness = build(8);
+    harness.state.steering = ['first', 'second', 'third', 'fourth', 'fifth'];
+    // The harness composer opens with the autocomplete closed.
+    const minimumEditorRows = harness.editor.minimumViewportRows();
+    const chromeLines = harness.chrome.render(80).map((line) => stripAnsi(line));
+    const queuedEditorRows = harness.editor.viewportRowsHistory.at(-1) ?? 0;
+
+    assert.ok(
+      queuedEditorRows >= minimumEditorRows,
+      `the composer was budgeted ${queuedEditorRows} rows, below its ${minimumEditorRows}-row minimum`,
+    );
+    // The queue trims first, so what it gives back keeps the chrome inside the
+    // rows left after the transcript's reserved row (FULLSCREEN_TRANSCRIPT_MIN_ROWS).
+    assert.ok(
+      chromeLines.length <= 8 - 1,
+      `chrome emitted ${chromeLines.length} rows into the 7 rows left below the reserved transcript row`,
+    );
+    // Five queued messages stay represented: trimmed to the rows the queue may
+    // take, with the hidden ones reported rather than dropped.
+    assert.match(chromeLines.join('\n'), /Steering: first/, 'the queue keeps its leading message');
+    assert.match(chromeLines.join('\n'), /… 5 more/, 'the trimmed queue reports what it hid');
+
+    const lines = harness.plainLines();
+    assert.equal(lines.length, 8);
+    assert.match(
+      lines.at(-1) ?? '',
+      /claude-sonnet-4-5/,
+      'the status line holds the last screen row',
+    );
+    assert.match(lines.at(-2) ?? '', /╰/, 'the composer stays fully drawn above the status line');
   });
 
   test('keeps the composer anchored at the bottom of the viewport', () => {
